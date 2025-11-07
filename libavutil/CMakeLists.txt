@@ -123,7 +123,7 @@ set(AVUTIL_SOURCES
     float_dsp.c
     float_scalarproduct.c
     film_grain_params.c
-    fixed_dsp.c
+    fixed_dsp.cpp
     frame.c
     hash.c
     hdr_dynamic_metadata.c
