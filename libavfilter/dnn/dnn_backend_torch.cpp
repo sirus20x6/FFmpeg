@@ -60,14 +60,14 @@ typedef struct THRequestItem {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption dnn_th_options[] = {
     { "optimize", "turn on graph executor optimization", OFFSET(optimize), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS},
-    { NULL }
+    { nullptr }
 };
 
 static int extract_lltask_from_task(TaskItem *task, Queue *lltask_queue)
 {
-    THModel *th_model = (THModel *)task->model;
+    auto *th_model = static_cast<THModel *>(task->model);
     DnnContext *ctx = th_model->ctx;
-    LastLevelTaskItem *lltask = (LastLevelTaskItem *)av_malloc(sizeof(*lltask));
+    auto *lltask = static_cast<LastLevelTaskItem *>(av_malloc(sizeof(*lltask)));
     if (!lltask) {
         av_log(ctx, AV_LOG_ERROR, "Failed to allocate memory for LastLevelTaskItem\n");
         return AVERROR(ENOMEM);
@@ -88,14 +88,13 @@ static void th_free_request(THInferRequest *request)
     if (!request)
         return;
     if (request->output) {
-        delete(request->output);
-        request->output = NULL;
+        delete request->output;
+        request->output = nullptr;
     }
     if (request->input_tensor) {
-        delete(request->input_tensor);
-        request->input_tensor = NULL;
+        delete request->input_tensor;
+        request->input_tensor = nullptr;
     }
-    return;
 }
 
 static inline void destroy_request_item(THRequestItem **arg)
@@ -114,25 +113,24 @@ static inline void destroy_request_item(THRequestItem **arg)
 
 static void dnn_free_model_th(DNNModel **model)
 {
-    THModel *th_model;
     if (!model || !*model)
         return;
 
-    th_model = (THModel *) (*model);
+    auto *th_model = static_cast<THModel *>(*model);
     while (ff_safe_queue_size(th_model->request_queue) != 0) {
-        THRequestItem *item = (THRequestItem *)ff_safe_queue_pop_front(th_model->request_queue);
+        auto *item = static_cast<THRequestItem *>(ff_safe_queue_pop_front(th_model->request_queue));
         destroy_request_item(&item);
     }
     ff_safe_queue_destroy(th_model->request_queue);
 
     while (ff_queue_size(th_model->lltask_queue) != 0) {
-        LastLevelTaskItem *item = (LastLevelTaskItem *)ff_queue_pop_front(th_model->lltask_queue);
+        auto *item = static_cast<LastLevelTaskItem *>(ff_queue_pop_front(th_model->lltask_queue));
         av_freep(&item);
     }
     ff_queue_destroy(th_model->lltask_queue);
 
     while (ff_queue_size(th_model->task_queue) != 0) {
-        TaskItem *item = (TaskItem *)ff_queue_pop_front(th_model->task_queue);
+        auto *item = static_cast<TaskItem *>(ff_queue_pop_front(th_model->task_queue));
         av_frame_free(&item->in_frame);
         av_frame_free(&item->out_frame);
         av_freep(&item);
@@ -140,7 +138,7 @@ static void dnn_free_model_th(DNNModel **model)
     ff_queue_destroy(th_model->task_queue);
     delete th_model->jit_model;
     av_freep(&th_model);
-    *model = NULL;
+    *model = nullptr;
 }
 
 static int get_input_th(DNNModel *model, DNNData *input, const char *input_name)
@@ -162,14 +160,14 @@ static void deleter(void *arg)
 
 static int fill_model_input_th(THModel *th_model, THRequestItem *request)
 {
-    LastLevelTaskItem *lltask = NULL;
-    TaskItem *task = NULL;
-    THInferRequest *infer_request = NULL;
+    LastLevelTaskItem *lltask = nullptr;
+    TaskItem *task = nullptr;
+    THInferRequest *infer_request = nullptr;
     DNNData input = { 0 };
     DnnContext *ctx = th_model->ctx;
     int ret, width_idx, height_idx, channel_idx;
 
-    lltask = (LastLevelTaskItem *)ff_queue_pop_front(th_model->lltask_queue);
+    lltask = static_cast<LastLevelTaskItem *>(ff_queue_pop_front(th_model->lltask_queue));
     if (!lltask) {
         ret = AVERROR(EINVAL);
         goto err;
@@ -178,7 +176,7 @@ static int fill_model_input_th(THModel *th_model, THRequestItem *request)
     task = lltask->task;
     infer_request = request->infer_request;
 
-    ret = get_input_th(&th_model->model, &input, NULL);
+    ret = get_input_th(&th_model->model, &input, nullptr);
     if ( ret != 0) {
         goto err;
     }
@@ -198,7 +196,7 @@ static int fill_model_input_th(THModel *th_model, THRequestItem *request)
     case DFT_PROCESS_FRAME:
         input.scale = 255;
         if (task->do_ioproc) {
-            if (th_model->model.frame_pre_proc != NULL) {
+            if (th_model->model.frame_pre_proc != nullptr) {
                 th_model->model.frame_pre_proc(task->in_frame, &input, th_model->model.filter_ctx);
             } else {
                 ff_proc_from_frame_to_dnn(task->in_frame, &input, ctx);
@@ -206,7 +204,7 @@ static int fill_model_input_th(THModel *th_model, THRequestItem *request)
         }
         break;
     default:
-        avpriv_report_missing_feature(NULL, "model function type %d", th_model->model.func_type);
+        avpriv_report_missing_feature(nullptr, "model function type %d", th_model->model.func_type);
         break;
     }
     *infer_request->input_tensor = torch::from_blob(input.data,
@@ -221,24 +219,20 @@ err:
 
 static int th_start_inference(void *args)
 {
-    THRequestItem *request = (THRequestItem *)args;
-    THInferRequest *infer_request = NULL;
-    LastLevelTaskItem *lltask = NULL;
-    TaskItem *task = NULL;
-    THModel *th_model = NULL;
-    DnnContext *ctx = NULL;
-    std::vector<torch::jit::IValue> inputs;
-    torch::NoGradGuard no_grad;
-
+    auto *request = static_cast<THRequestItem *>(args);
     if (!request) {
-        av_log(NULL, AV_LOG_ERROR, "THRequestItem is NULL\n");
+        av_log(nullptr, AV_LOG_ERROR, "THRequestItem is NULL\n");
         return AVERROR(EINVAL);
     }
-    infer_request = request->infer_request;
-    lltask = request->lltask;
-    task = lltask->task;
-    th_model = (THModel *)task->model;
-    ctx = th_model->ctx;
+
+    THInferRequest *infer_request = request->infer_request;
+    LastLevelTaskItem *lltask = request->lltask;
+    TaskItem *task = lltask->task;
+    auto *th_model = static_cast<THModel *>(task->model);
+    DnnContext *ctx = th_model->ctx;
+
+    std::vector<torch::jit::IValue> inputs;
+    torch::NoGradGuard no_grad;
 
     if (ctx->torch_option.optimize)
         torch::jit::setGraphExecutorOptimize(true);
@@ -261,12 +255,12 @@ static int th_start_inference(void *args)
 }
 
 static void infer_completion_callback(void *args) {
-    THRequestItem *request = (THRequestItem*)args;
+    auto *request = static_cast<THRequestItem*>(args);
     LastLevelTaskItem *lltask = request->lltask;
     TaskItem *task = lltask->task;
     DNNData outputs = { 0 };
     THInferRequest *infer_request = request->infer_request;
-    THModel *th_model = (THModel *)task->model;
+    auto *th_model = static_cast<THModel *>(task->model);
     torch::Tensor *output = infer_request->output;
 
     c10::IntArrayRef sizes = output->sizes();
@@ -293,7 +287,7 @@ static void infer_completion_callback(void *args) {
                 *output = output->to(torch::kCPU);
             outputs.scale = 255;
             outputs.data = output->data_ptr();
-            if (th_model->model.frame_post_proc != NULL) {
+            if (th_model->model.frame_post_proc != nullptr) {
                 th_model->model.frame_post_proc(task->out_frame, &outputs, th_model->model.filter_ctx);
             } else {
                 ff_proc_from_dnn_to_frame(task->out_frame, &outputs, th_model->ctx);
@@ -320,9 +314,6 @@ err:
 
 static int execute_model_th(THRequestItem *request, Queue *lltask_queue)
 {
-    THModel *th_model = NULL;
-    LastLevelTaskItem *lltask;
-    TaskItem *task = NULL;
     int ret = 0;
 
     if (ff_queue_size(lltask_queue) == 0) {
@@ -330,14 +321,14 @@ static int execute_model_th(THRequestItem *request, Queue *lltask_queue)
         return 0;
     }
 
-    lltask = (LastLevelTaskItem *)ff_queue_peek_front(lltask_queue);
-    if (lltask == NULL) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to get LastLevelTaskItem\n");
+    auto *lltask = static_cast<LastLevelTaskItem *>(ff_queue_peek_front(lltask_queue));
+    if (lltask == nullptr) {
+        av_log(nullptr, AV_LOG_ERROR, "Failed to get LastLevelTaskItem\n");
         ret = AVERROR(EINVAL);
         goto err;
     }
-    task = lltask->task;
-    th_model = (THModel *)task->model;
+    TaskItem *task = lltask->task;
+    auto *th_model = static_cast<THModel *>(task->model);
 
     ret = fill_model_input_th(th_model, request);
     if ( ret != 0) {
@@ -366,16 +357,16 @@ static int get_output_th(DNNModel *model, const char *input_name, int input_widt
                                    const char *output_name, int *output_width, int *output_height)
 {
     int ret = 0;
-    THModel *th_model = (THModel*) model;
+    auto *th_model = static_cast<THModel*>(model);
     DnnContext *ctx = th_model->ctx;
     TaskItem task = { 0 };
-    THRequestItem *request = NULL;
+    THRequestItem *request = nullptr;
     DNNExecBaseParams exec_params = {
         .input_name     = input_name,
         .output_names   = &output_name,
         .nb_output      = 1,
-        .in_frame       = NULL,
-        .out_frame      = NULL,
+        .in_frame       = nullptr,
+        .out_frame      = nullptr,
     };
     ret = ff_dnn_fill_gettingoutput_task(&task, &exec_params, th_model, input_height, input_width, ctx);
     if ( ret != 0) {
@@ -388,7 +379,7 @@ static int get_output_th(DNNModel *model, const char *input_name, int input_widt
         goto err;
     }
 
-    request = (THRequestItem*) ff_safe_queue_pop_front(th_model->request_queue);
+    request = static_cast<THRequestItem*>(ff_safe_queue_pop_front(th_model->request_queue));
     if (!request) {
         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
         ret = AVERROR(EINVAL);
@@ -407,25 +398,24 @@ err:
 
 static THInferRequest *th_create_inference_request(void)
 {
-    THInferRequest *request = (THInferRequest *)av_malloc(sizeof(THInferRequest));
+    auto *request = static_cast<THInferRequest *>(av_malloc(sizeof(THInferRequest)));
     if (!request) {
-        return NULL;
+        return nullptr;
     }
-    request->input_tensor = NULL;
-    request->output = NULL;
+    request->input_tensor = nullptr;
+    request->output = nullptr;
     return request;
 }
 
 static DNNModel *dnn_load_model_th(DnnContext *ctx, DNNFunctionType func_type, AVFilterContext *filter_ctx)
 {
-    DNNModel *model = NULL;
-    THModel *th_model = NULL;
-    THRequestItem *item = NULL;
+    DNNModel *model = nullptr;
+    THRequestItem *item = nullptr;
     const char *device_name = ctx->device ? ctx->device : "cpu";
 
-    th_model = (THModel *)av_mallocz(sizeof(THModel));
+    auto *th_model = static_cast<THModel *>(av_mallocz(sizeof(THModel)));
     if (!th_model)
-        return NULL;
+        return nullptr;
     model = &th_model->model;
     th_model->ctx = ctx;
 
@@ -455,14 +445,14 @@ static DNNModel *dnn_load_model_th(DnnContext *ctx, DNNFunctionType func_type, A
         goto fail;
     }
 
-    item = (THRequestItem *)av_mallocz(sizeof(THRequestItem));
+    item = static_cast<THRequestItem *>(av_mallocz(sizeof(THRequestItem)));
     if (!item) {
         goto fail;
     }
-    item->lltask = NULL;
+    item->lltask = nullptr;
     item->infer_request = th_create_inference_request();
     if (!item->infer_request) {
-        av_log(NULL, AV_LOG_ERROR, "Failed to allocate memory for Torch inference request\n");
+        av_log(nullptr, AV_LOG_ERROR, "Failed to allocate memory for Torch inference request\n");
         goto fail;
     }
     item->exec_module.start_inference = &th_start_inference;
@@ -472,7 +462,7 @@ static DNNModel *dnn_load_model_th(DnnContext *ctx, DNNFunctionType func_type, A
     if (ff_safe_queue_push_back(th_model->request_queue, item) < 0) {
         goto fail;
     }
-    item = NULL;
+    item = nullptr;
 
     th_model->task_queue = ff_queue_create();
     if (!th_model->task_queue) {
@@ -496,12 +486,12 @@ fail:
         av_freep(&item);
     }
     dnn_free_model_th(&model);
-    return NULL;
+    return nullptr;
 }
 
 static int dnn_execute_model_th(const DNNModel *model, DNNExecBaseParams *exec_params)
 {
-    THModel *th_model = (THModel *)model;
+    auto *th_model = static_cast<THModel *>(const_cast<DNNModel*>(model));
     DnnContext *ctx = th_model->ctx;
     TaskItem *task;
     THRequestItem *request;
@@ -513,7 +503,7 @@ static int dnn_execute_model_th(const DNNModel *model, DNNExecBaseParams *exec_p
         return ret;
     }
 
-    task = (TaskItem *)av_malloc(sizeof(TaskItem));
+    task = static_cast<TaskItem *>(av_malloc(sizeof(TaskItem)));
     if (!task) {
         av_log(ctx, AV_LOG_ERROR, "unable to alloc memory for task item.\n");
         return AVERROR(ENOMEM);
@@ -539,7 +529,7 @@ static int dnn_execute_model_th(const DNNModel *model, DNNExecBaseParams *exec_p
         return ret;
     }
 
-    request = (THRequestItem *)ff_safe_queue_pop_front(th_model->request_queue);
+    request = static_cast<THRequestItem *>(ff_safe_queue_pop_front(th_model->request_queue));
     if (!request) {
         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
         return AVERROR(EINVAL);
@@ -550,20 +540,20 @@ static int dnn_execute_model_th(const DNNModel *model, DNNExecBaseParams *exec_p
 
 static DNNAsyncStatusType dnn_get_result_th(const DNNModel *model, AVFrame **in, AVFrame **out)
 {
-    THModel *th_model = (THModel *)model;
+    auto *th_model = static_cast<THModel *>(const_cast<DNNModel*>(model));
     return ff_dnn_get_result_common(th_model->task_queue, in, out);
 }
 
 static int dnn_flush_th(const DNNModel *model)
 {
-    THModel *th_model = (THModel *)model;
+    auto *th_model = static_cast<THModel *>(const_cast<DNNModel*>(model));
     THRequestItem *request;
 
     if (ff_queue_size(th_model->lltask_queue) == 0)
         // no pending task need to flush
         return 0;
 
-    request = (THRequestItem *)ff_safe_queue_pop_front(th_model->request_queue);
+    request = static_cast<THRequestItem *>(ff_safe_queue_pop_front(th_model->request_queue));
     if (!request) {
         av_log(th_model->ctx, AV_LOG_ERROR, "unable to get infer request.\n");
         return AVERROR(EINVAL);

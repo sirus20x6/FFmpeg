@@ -47,3 +47,4 @@
 /libavfilter/vulkan/*.c
 /.*/
 !/.forgejo/
+build/
