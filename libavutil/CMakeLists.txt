@@ -132,7 +132,7 @@ set(AVUTIL_SOURCES
     hwcontext.c
     iamf.c
     imgutils.c
-    integer.c
+    integer.cpp
     intmath.c
     lfg.c
     lls.c
