@@ -137,7 +137,7 @@ set(AVUTIL_SOURCES
     lfg.c
     lls.c
     log.c
-    log2_tab.c
+    log2_tab.cpp
     lzo.c
     mathematics.c
     mastering_display_metadata.c

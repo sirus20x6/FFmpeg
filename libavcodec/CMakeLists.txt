@@ -22,7 +22,7 @@ set(AVCODEC_SOURCES
     get_buffer.c
     imgconvert.c
     jni.c
-    mathtables.c
+    mathtables.cpp
     mediacodec.c
     mpeg12framerate.c
     options.c
