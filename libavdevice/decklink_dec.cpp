@@ -338,14 +338,14 @@ static uint8_t *vanc_to_cc(AVFormatContext *avctx, uint16_t *buf, size_t words,
     uint16_t *cdp = &buf[6]; // CDP follows
     if (cdp[0] != 0x96 || cdp[1] != 0x69) {
         av_log(avctx, AV_LOG_WARNING, "Invalid CDP header 0x%.2x 0x%.2x\n", cdp[0], cdp[1]);
-        return NULL;
+        return nullptr;
     }
 
     len -= 7; // remove VANC header and checksum
 
     if (cdp[2] != len) {
         av_log(avctx, AV_LOG_WARNING, "CDP len %d != %zu\n", cdp[2], len);
-        return NULL;
+        return nullptr;
     }
 
     cdp_sum = 0;
@@ -354,58 +354,58 @@ static uint8_t *vanc_to_cc(AVFormatContext *avctx, uint16_t *buf, size_t words,
     cdp_sum = cdp_sum ? 256 - cdp_sum : 0;
     if (cdp[len - 1] != cdp_sum) {
         av_log(avctx, AV_LOG_WARNING, "CDP checksum invalid 0x%.4x != 0x%.4x\n", cdp_sum, cdp[len-1]);
-        return NULL;
+        return nullptr;
     }
 
     rate = cdp[3];
     if (!(rate & 0x0f)) {
         av_log(avctx, AV_LOG_WARNING, "CDP frame rate invalid (0x%.2x)\n", rate);
-        return NULL;
+        return nullptr;
     }
     rate >>= 4;
     if (rate > 8) {
         av_log(avctx, AV_LOG_WARNING, "CDP frame rate invalid (0x%.2x)\n", rate);
-        return NULL;
+        return nullptr;
     }
 
     if (!(cdp[4] & 0x43)) /* ccdata_present | caption_service_active | reserved */ {
         av_log(avctx, AV_LOG_WARNING, "CDP flags invalid (0x%.2x)\n", cdp[4]);
-        return NULL;
+        return nullptr;
     }
 
     hdr = (cdp[5] << 8) | cdp[6];
     if (cdp[7] != 0x72) /* ccdata_id */ {
         av_log(avctx, AV_LOG_WARNING, "Invalid ccdata_id 0x%.2x\n", cdp[7]);
-        return NULL;
+        return nullptr;
     }
 
     cc_count = cdp[8];
     if (!(cc_count & 0xe0)) {
         av_log(avctx, AV_LOG_WARNING, "Invalid cc_count 0x%.2x\n", cc_count);
-        return NULL;
+        return nullptr;
     }
 
     cc_count &= 0x1f;
     if ((len - 13) < cc_count * 3) {
         av_log(avctx, AV_LOG_WARNING, "Invalid cc_count %d (> %zu)\n", cc_count * 3, len - 13);
-        return NULL;
+        return nullptr;
     }
 
     if (cdp[len - 4] != 0x74) /* footer id */ {
         av_log(avctx, AV_LOG_WARNING, "Invalid footer id 0x%.2x\n", cdp[len-4]);
-        return NULL;
+        return nullptr;
     }
 
     ftr = (cdp[len - 3] << 8) | cdp[len - 2];
     if (ftr != hdr) {
         av_log(avctx, AV_LOG_WARNING, "Header 0x%.4x != Footer 0x%.4x\n", hdr, ftr);
-        return NULL;
+        return nullptr;
     }
 
-    cc = (uint8_t *)av_malloc(cc_count * 3);
-    if (cc == NULL) {
+    cc = static_cast<uint8_t *>av_malloc(cc_count * 3);
+    if (cc == nullptr) {
         av_log(avctx, AV_LOG_WARNING, "CC - av_malloc failed for cc_count = %d\n", cc_count);
-        return NULL;
+        return nullptr;
     }
 
     for (size_t i = 0; i < cc_count; i++) {
@@ -421,7 +421,7 @@ static uint8_t *vanc_to_cc(AVFormatContext *avctx, uint16_t *buf, size_t words,
 static uint8_t *get_metadata(AVFormatContext *avctx, uint16_t *buf, size_t width,
                              uint8_t *tgt, size_t tgt_size, AVPacket *pkt)
 {
-    decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
+    decklink_cctx *cctx = static_cast<struct decklink_cctx *> avctx->priv_data;
     uint16_t *max_buf = buf + width;
 
     while (buf < max_buf - 6) {
@@ -599,8 +599,8 @@ private:
 decklink_input_callback::decklink_input_callback(AVFormatContext *_avctx) : _refs(1)
 {
     avctx = _avctx;
-    decklink_cctx       *cctx = (struct decklink_cctx *)avctx->priv_data;
-    ctx = (struct decklink_ctx *)cctx->ctx;
+    decklink_cctx       *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     no_video = 0;
     initial_audio_pts = initial_video_pts = AV_NOPTS_VALUE;
     last_video_frame = nullptr;
@@ -734,7 +734,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
     BMDTimeValue frameDuration;
     int64_t wallclock = 0, abs_wallclock = 0;
     int64_t video_pkt_pts, audio_pkt_pts;
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *> avctx->priv_data;
 
     if (ctx->autodetect) {
         if (videoFrame && !(videoFrame->GetFlags() & bmdFrameHasNoInputSource) &&
@@ -822,7 +822,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
                     char tcstr[AV_TIMECODE_STR_SIZE];
                     const char *tc = av_timecode_make_string(&tcr, tcstr, 0);
                     if (tc) {
-                        AVDictionary* metadata_dict = NULL;
+                        AVDictionary* metadata_dict = nullptr;
                         uint8_t* packed_metadata;
 
                         if (av_cmp_q(ctx->video_st->r_frame_rate, av_make_q(60, 1)) < 1) {
@@ -869,7 +869,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         //To be made sure it still applies
         pkt.flags       |= AV_PKT_FLAG_KEY;
         pkt.stream_index = ctx->video_st->index;
-        pkt.data         = (uint8_t *)frameBytes;
+        pkt.data         = static_cast<uint8_t *>frameBytes;
         pkt.size         = videoFrame->GetRowBytes() *
                            videoFrame->GetHeight();
         //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
@@ -971,7 +971,7 @@ HRESULT decklink_input_callback::VideoInputFrameArrived(
         //fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
         pkt.flags       |= AV_PKT_FLAG_KEY;
         pkt.stream_index = ctx->audio_st->index;
-        pkt.data         = (uint8_t *)audioFrameBytes;
+        pkt.data         = static_cast<uint8_t *>audioFrameBytes;
 
         if (ff_decklink_packet_queue_put(&ctx->queue, &pkt) < 0) {
             ++ctx->dropped;
@@ -985,7 +985,7 @@ HRESULT decklink_input_callback::VideoInputFormatChanged(
     BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode,
     BMDDetectedVideoInputFormatFlags formatFlags)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *) avctx->priv_data;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *> avctx->priv_data;
     ctx->bmd_mode = mode->GetDisplayMode();
     // check the C context member to make sure we set both raw_format and bmd_mode with data from the same format change callback
     if (!cctx->raw_format)
@@ -994,7 +994,7 @@ HRESULT decklink_input_callback::VideoInputFormatChanged(
 }
 
 static int decklink_autodetect(struct decklink_cctx *cctx) {
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     DECKLINK_BOOL autodetect_supported = false;
     int i;
 
@@ -1045,8 +1045,8 @@ extern "C" {
 
 av_cold int ff_decklink_read_close(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
 
     if (ctx->dli) {
         ctx->dli->StopStreams();
@@ -1065,7 +1065,7 @@ av_cold int ff_decklink_read_close(AVFormatContext *avctx)
 
 av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
     struct decklink_ctx *ctx;
     class decklink_allocator *allocator;
     class decklink_input_callback *input_callback;
@@ -1073,7 +1073,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     HRESULT result;
     int ret;
 
-    ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
+    ctx = static_cast<struct decklink_ctx *> av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
         return AVERROR(ENOMEM);
     ctx->list_devices = cctx->list_devices;
@@ -1203,7 +1203,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
 #endif
 
     /* Setup streams. */
-    st = avformat_new_stream(avctx, NULL);
+    st = avformat_new_stream(avctx, nullptr);
     if (!st) {
         av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
         ret = AVERROR(ENOMEM);
@@ -1216,7 +1216,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
     ctx->audio_st=st;
 
-    st = avformat_new_stream(avctx, NULL);
+    st = avformat_new_stream(avctx, nullptr);
     if (!st) {
         av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
         ret = AVERROR(ENOMEM);
@@ -1280,7 +1280,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     ctx->video_st=st;
 
     if (ctx->enable_klv) {
-        st = avformat_new_stream(avctx, NULL);
+        st = avformat_new_stream(avctx, nullptr);
         if (!st) {
             ret = AVERROR(ENOMEM);
             goto error;
@@ -1294,7 +1294,7 @@ av_cold int ff_decklink_read_header(AVFormatContext *avctx)
     }
 
     if (ctx->teletext_lines) {
-        st = avformat_new_stream(avctx, NULL);
+        st = avformat_new_stream(avctx, nullptr);
         if (!st) {
             av_log(avctx, AV_LOG_ERROR, "Cannot add stream\n");
             ret = AVERROR(ENOMEM);
@@ -1345,12 +1345,12 @@ error:
 
 int ff_decklink_read_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
 
     ff_decklink_packet_queue_get(&ctx->queue, pkt, 1);
 
-    if (ctx->tc_format && !(av_dict_get(ctx->video_st->metadata, "timecode", NULL, 0))) {
+    if (ctx->tc_format && !(av_dict_get(ctx->video_st->metadata, "timecode", nullptr, 0))) {
         size_t size;
         const uint8_t *side_metadata = av_packet_get_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, &size);
         if (side_metadata) {

@@ -52,9 +52,9 @@ class decklink_frame : public IDeckLinkVideoFrame
 {
 public:
     decklink_frame(struct decklink_ctx *ctx, AVFrame *avframe, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(avframe), _avpacket(NULL), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width),  _refs(1) { }
+        _ctx(ctx), _avframe(avframe), _avpacket(nullptr), _codec_id(codec_id), _ancillary(nullptr), _height(height), _width(width),  _refs(1) { }
     decklink_frame(struct decklink_ctx *ctx, AVPacket *avpacket, AVCodecID codec_id, int height, int width) :
-        _ctx(ctx), _avframe(NULL), _avpacket(avpacket), _codec_id(codec_id), _ancillary(NULL), _height(height), _width(width), _refs(1) { }
+        _ctx(ctx), _avframe(nullptr), _avpacket(avpacket), _codec_id(codec_id), _ancillary(nullptr), _height(height), _width(width), _refs(1) { }
     virtual long           STDMETHODCALLTYPE GetWidth      (void)          { return _width; }
     virtual long           STDMETHODCALLTYPE GetHeight     (void)          { return _height; }
     virtual long           STDMETHODCALLTYPE GetRowBytes   (void)
@@ -166,8 +166,8 @@ public:
 
 static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     AVCodecParameters *c = st->codecpar;
 
     if (ctx->video) {
@@ -220,8 +220,8 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
     /* Buffer twice as many frames as the preroll. */
     ctx->frames_buffer = ctx->frames_preroll * 2;
     ctx->frames_buffer = FFMIN(ctx->frames_buffer, 60);
-    pthread_mutex_init(&ctx->mutex, NULL);
-    pthread_cond_init(&ctx->cond, NULL);
+    pthread_mutex_init(&ctx->mutex, nullptr);
+    pthread_cond_init(&ctx->cond, nullptr);
     ctx->frames_buffer_available_spots = ctx->frames_buffer;
 
     av_log(avctx, AV_LOG_DEBUG, "output: %s, preroll: %d, frames buffer size: %d\n",
@@ -237,8 +237,8 @@ static int decklink_setup_video(AVFormatContext *avctx, AVStream *st)
 
 static int decklink_setup_audio(AVFormatContext *avctx, AVStream *st)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     AVCodecParameters *c = st->codecpar;
 
     if (ctx->audio) {
@@ -305,8 +305,8 @@ static int create_s337_payload(AVPacket *pkt, uint8_t **outbuf, int *outsize)
         return AVERROR(EINVAL);
 
     /* Encapsulate AC3 syncframe into SMPTE 337 packet */
-    s337_payload = (uint8_t *) av_malloc(payload_size);
-    if (s337_payload == NULL)
+    s337_payload = static_cast<uint8_t *> av_malloc(payload_size);
+    if (s337_payload == nullptr)
         return AVERROR(ENOMEM);
     bytestream2_init_writer(&pb, s337_payload, payload_size);
     bytestream2_put_le16u(&pb, 0xf872); /* Sync word 1 */
@@ -367,8 +367,8 @@ static int decklink_setup_data(AVFormatContext *avctx, AVStream *st)
 
 av_cold int ff_decklink_write_trailer(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
 
     if (ctx->playback_started) {
         BMDTimeValue actual;
@@ -465,8 +465,8 @@ static void construct_afd(AVFormatContext *avctx, struct decklink_ctx *ctx,
                           AVPacket *pkt, struct klvanc_line_set_s *vanc_lines,
                           AVStream *st)
 {
-    struct klvanc_packet_afd_s *afd = NULL;
-    uint16_t *afd_words = NULL;
+    struct klvanc_packet_afd_s *afd = nullptr;
+    uint16_t *afd_words = nullptr;
     uint16_t len;
     size_t size;
     int f1_line = 12, f2_line = 0, ret;
@@ -595,17 +595,17 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
 
         vanc_st = avctx->streams[vanc_pkt.stream_index];
         if (vanc_st->codecpar->codec_id == AV_CODEC_ID_SMPTE_2038) {
-            struct klvanc_smpte2038_anc_data_packet_s *pkt_2038 = NULL;
+            struct klvanc_smpte2038_anc_data_packet_s *pkt_2038 = nullptr;
 
             klvanc_smpte2038_parse_pes_payload(vanc_pkt.data, vanc_pkt.size, &pkt_2038);
-            if (pkt_2038 == NULL) {
+            if (pkt_2038 == nullptr) {
                 av_log(avctx, AV_LOG_ERROR, "failed to decode SMPTE 2038 PES packet");
                 av_packet_unref(&vanc_pkt);
                 continue;
             }
             for (int i = 0; i < pkt_2038->lineCount; i++) {
                 struct klvanc_smpte2038_anc_data_line_s *l = &pkt_2038->lines[i];
-                uint16_t *vancWords = NULL;
+                uint16_t *vancWords = nullptr;
                 uint16_t vancWordCount;
 
                 if (klvanc_smpte2038_convert_line_to_words(l, &vancWords,
@@ -654,7 +654,7 @@ static int decklink_construct_vanc(AVFormatContext *avctx, struct decklink_ctx *
         }
 
         /* Generate the full line taking into account all VANC packets on that line */
-        result = klvanc_generate_vanc_line_v210(ctx->vanc_ctx, line, (uint8_t *) buf,
+        result = klvanc_generate_vanc_line_v210(ctx->vanc_ctx, line, static_cast<uint8_t *> buf,
                                                 ctx->bmd_width);
         if (result) {
             av_log(avctx, AV_LOG_ERROR, "Failed to generate VANC line\n");
@@ -679,11 +679,11 @@ done:
 
 static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     AVStream *st = avctx->streams[pkt->stream_index];
-    AVFrame *avframe = NULL, *tmp = (AVFrame *)pkt->data;
-    AVPacket *avpacket = NULL;
+    AVFrame *avframe = nullptr, *tmp = (AVFrame *)pkt->data;
+    AVPacket *avpacket = nullptr;
     decklink_frame *frame;
     uint32_t buffered;
     HRESULT hr;
@@ -776,12 +776,12 @@ static int decklink_write_video_packet(AVFormatContext *avctx, AVPacket *pkt)
 
 static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
     AVStream *st = avctx->streams[pkt->stream_index];
     int sample_count;
     uint32_t buffered;
-    uint8_t *outbuf = NULL;
+    uint8_t *outbuf = nullptr;
     int ret = 0;
 
     ctx->dlo->GetBufferedAudioSampleFrameCount(&buffered);
@@ -802,7 +802,7 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
     }
 
     if (ctx->dlo->ScheduleAudioSamples(outbuf, sample_count, pkt->pts,
-                                       bmdAudioSampleRate48kHz, NULL) != S_OK) {
+                                       bmdAudioSampleRate48kHz, nullptr) != S_OK) {
         av_log(avctx, AV_LOG_ERROR, "Could not schedule audio samples.\n");
         ret = AVERROR(EIO);
     }
@@ -815,8 +815,8 @@ static int decklink_write_audio_packet(AVFormatContext *avctx, AVPacket *pkt)
 
 static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
 
     ff_ccfifo_extractbytes(&ctx->cc_fifo, pkt->data, pkt->size);
 
@@ -825,8 +825,8 @@ static int decklink_write_subtitle_packet(AVFormatContext *avctx, AVPacket *pkt)
 
 static int decklink_write_data_packet(AVFormatContext *avctx, AVPacket *pkt)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
-    struct decklink_ctx *ctx = (struct decklink_ctx *)cctx->ctx;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
+    struct decklink_ctx *ctx = static_cast<struct decklink_ctx *>cctx->ctx;
 
     if (ff_decklink_packet_queue_put(&ctx->vanc_queue, pkt) < 0) {
         av_log(avctx, AV_LOG_WARNING, "Failed to queue DATA packet\n");
@@ -839,12 +839,12 @@ extern "C" {
 
 av_cold int ff_decklink_write_header(AVFormatContext *avctx)
 {
-    struct decklink_cctx *cctx = (struct decklink_cctx *)avctx->priv_data;
+    struct decklink_cctx *cctx = static_cast<struct decklink_cctx *>avctx->priv_data;
     struct decklink_ctx *ctx;
     unsigned int n;
     int ret;
 
-    ctx = (struct decklink_ctx *) av_mallocz(sizeof(struct decklink_ctx));
+    ctx = static_cast<struct decklink_ctx *> av_mallocz(sizeof(struct decklink_ctx));
     if (!ctx)
         return AVERROR(ENOMEM);
     ctx->list_devices = cctx->list_devices;

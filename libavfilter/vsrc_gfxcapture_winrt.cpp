@@ -169,7 +169,7 @@ struct GfxCaptureContextCpp {
 template <typename T>
 static HRESULT get_activation_factory(GfxCaptureContextCpp *ctx, PCWSTR clsid, T** factory) {
     HSTRING_HEADER hsheader = { 0 };
-    HSTRING hs = NULL;
+    HSTRING hs = nullptr;
 
     HRESULT hr = ctx->fn.WindowsCreateStringReference(clsid, (UINT32)wcslen(clsid), &hsheader, &hs);
     if (FAILED(hr))
@@ -555,7 +555,7 @@ static int wgc_thread_worker(AVFilterContext *avctx)
 
     av_log(avctx, AV_LOG_DEBUG, "Starting message loop\n");
 
-    while (BOOL res = GetMessage(&msg, NULL, 0, 0)) {
+    while (BOOL res = GetMessage(&msg, nullptr, 0, 0)) {
         if (res == -1) {
             av_log(avctx, AV_LOG_ERROR, "Failed to get message\n");
             return AVERROR(EIO);
@@ -859,8 +859,8 @@ static int find_capture_source(AVFilterContext *avctx)
     GfxCaptureContextCpp *ctx = cctx->ctx;
     int cur_idx = 0;
 
-    ctx->capture_hwnd = NULL;
-    ctx->capture_hmonitor = NULL;
+    ctx->capture_hwnd = nullptr;
+    ctx->capture_hmonitor = nullptr;
 
     if (cctx->user_hmonitor) {
         ctx->capture_hmonitor = (HMONITOR)(uintptr_t)cctx->user_hmonitor;
@@ -877,7 +877,7 @@ static int find_capture_source(AVFilterContext *avctx)
             }
             return TRUE;
         });
-        if (EnumDisplayMonitors(NULL, NULL, cb->proc, cb->lparam) || !ctx->capture_hmonitor)
+        if (EnumDisplayMonitors(nullptr, nullptr, cb->proc, cb->lparam) || !ctx->capture_hmonitor)
             return AVERROR(ENOENT);
         return 0;
     } else if (cctx->window_text || cctx->window_class || cctx->window_exe) {
@@ -953,7 +953,7 @@ static int find_capture_source(AVFilterContext *avctx)
 
         if (cctx->monitor_idx == GFX_MONITOR_IDX_WINDOW) {
             ctx->capture_hmonitor = MonitorFromWindow(ctx->capture_hwnd, MONITOR_DEFAULTTONEAREST);
-            ctx->capture_hwnd = NULL;
+            ctx->capture_hwnd = nullptr;
             if (!ctx->capture_hmonitor) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to get monitor for capture window\n");
                 return AVERROR(ENOENT);
@@ -997,7 +997,7 @@ static av_cold int load_functions(AVFilterContext *avctx)
     GfxCaptureContextCpp *ctx = cctx->ctx;
 
 #define LOAD_DLL(handle, name) \
-    handle = hmodule_ptr_t(LoadLibraryExW(L##name, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)); \
+    handle = hmodule_ptr_t(LoadLibraryExW(L##name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)); \
     if (!handle) { \
         av_log(avctx, AV_LOG_ERROR, "Failed opening " #name "\n"); \
         return AVERROR(ENOSYS); \
@@ -1150,7 +1150,7 @@ static int prepare_render_resources(AVFilterContext *avctx)
     CD3D11_SAMPLER_DESC sampler_desc(CD3D11_DEFAULT{});
     UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
-    hr = ctx->fn.D3DCompile(render_shader_src, sizeof(render_shader_src) - 1, NULL, NULL, NULL, "main_vs", "vs_4_0", flags, 0, &vs_blob, &err_blob);
+    hr = ctx->fn.D3DCompile(render_shader_src, sizeof(render_shader_src) - 1, nullptr, nullptr, nullptr, "main_vs", "vs_4_0", flags, 0, &vs_blob, &err_blob);
     if (FAILED(hr)) {
         if (err_blob) {
             av_log(avctx, AV_LOG_ERROR, "Failed compiling vertex shader: %.*s\n", (int)err_blob->GetBufferSize(), (char*)err_blob->GetBufferPointer());
@@ -1166,7 +1166,7 @@ static int prepare_render_resources(AVFilterContext *avctx)
         sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     }
 
-    hr = ctx->fn.D3DCompile(render_shader_src, sizeof(render_shader_src) - 1, NULL, NULL, NULL, ps_entry, "ps_4_0", flags, 0, &ps_blob, &err_blob);
+    hr = ctx->fn.D3DCompile(render_shader_src, sizeof(render_shader_src) - 1, nullptr, nullptr, nullptr, ps_entry, "ps_4_0", flags, 0, &ps_blob, &err_blob);
     if (FAILED(hr)) {
         if (err_blob) {
             av_log(avctx, AV_LOG_ERROR, "Failed compiling pixel shader: %.*s\n", (int)err_blob->GetBufferSize(), (char*)err_blob->GetBufferPointer());
@@ -1176,8 +1176,8 @@ static int prepare_render_resources(AVFilterContext *avctx)
         return AVERROR_EXTERNAL;
     }
 
-    CHECK_HR_RET(ctx->device_hwctx->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), NULL, &d3dctx->vertex_shader));
-    CHECK_HR_RET(ctx->device_hwctx->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), NULL, &d3dctx->pixel_shader));
+    CHECK_HR_RET(ctx->device_hwctx->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &d3dctx->vertex_shader));
+    CHECK_HR_RET(ctx->device_hwctx->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &d3dctx->pixel_shader));
 
     CHECK_HR_RET(ctx->device_hwctx->device->CreateSamplerState(&sampler_desc, &d3dctx->sampler_state));
 
@@ -1187,7 +1187,7 @@ static int prepare_render_resources(AVFilterContext *avctx)
     cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-    CHECK_HR_RET(ctx->device_hwctx->device->CreateBuffer(&cb_desc, NULL, &d3dctx->shader_cb));
+    CHECK_HR_RET(ctx->device_hwctx->device->CreateBuffer(&cb_desc, nullptr, &d3dctx->shader_cb));
 
     CHECK_HR_RET(ctx->device_hwctx->device->CreateDeferredContext(0, &d3dctx->deferred_ctx));
 
@@ -1217,7 +1217,7 @@ static int gfxcapture_config_props(AVFilterLink *outlink)
 
         av_log(avctx, AV_LOG_VERBOSE, "Using provided hw_device_ctx\n");
     } else {
-        ret = av_hwdevice_ctx_create(&ctx->device_ref, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0);
+        ret = av_hwdevice_ctx_create(&ctx->device_ref, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to create D3D11VA device.\n");
             return ret;
