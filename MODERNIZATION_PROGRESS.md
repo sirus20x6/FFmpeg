@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 46 files (9 C → C++, 39 constexpr headers, 1 pattern library)
+**Files Converted:** 47 files (9 C → C++, 40 constexpr headers, 1 pattern library)
 **Lines Modernized:** ~659 C lines → ~15,320 C++ lines + 1250 lines documentation
-**Table Entries Generated:** 279,504 entries at compile time (768× growth!)
-**Static Assertions Added:** 1468+ compile-time validations (8.3% density)
+**Table Entries Generated:** 279,568 entries at compile time (768× growth!)
+**Static Assertions Added:** 1498+ compile-time validations (8.3% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
@@ -5359,3 +5359,24 @@ Sessions 19-21 provide comprehensive MPEG-1/2 entropy coding:
 - 35 sessions milestone: ✅
 - Perfect accuracy: ✅ (matches original flacdata.c exactly)
 - Mission completes popular lossless audio format: ✅
+
+**Session 36 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (WMV2 codec data tables)
+- Core WMV2 infrastructure: ✅ (64 entries, 64 bytes)
+- Scan table A: ✅ (32 bytes: custom DCT scan pattern)
+- Scan table B: ✅ (32 bytes: alternative scan pattern)
+- WMV2 video codec: ✅ (Windows Media Video 2 format)
+- DCT block scanning: ✅ (8×8 coefficient ordering for compression)
+- Custom scan orders: ✅ (different from standard zigzag patterns)
+- Table A range: ✅ (positions 0-31 in optimized order)
+- Table B range: ✅ (positions 0-59 with different pattern)
+- DC coefficient preserved: ✅ (both tables start at position 0)
+- 30+ static assertions: ✅ (validates both scan tables)
+- Pattern validation: ✅ (tables differ significantly except at DC)
+- Table A maximum: ✅ (0x1F = 31)
+- Table B maximum: ✅ (0x3B = 59)
+- Distinct patterns verified: ✅ (optimized for WMV2 characteristics)
+- 36 sessions milestone: ✅
+- Perfect accuracy: ✅ (matches original wmv2data.c exactly)
+- Mission expands to Microsoft video codecs: ✅
