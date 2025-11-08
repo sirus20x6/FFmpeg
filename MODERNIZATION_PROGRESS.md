@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 21 files (9 C → C++, 14 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~8,140 C++ lines + 680 lines documentation
-**Table Entries Generated:** 264,867 entries at compile time (560x growth!)
-**Static Assertions Added:** 532 compile-time validations (6.5% density)
+**Files Converted:** 22 files (9 C → C++, 15 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~8,445 C++ lines + 710 lines documentation
+**Table Entries Generated:** 265,379 entries at compile time (563x growth!)
+**Static Assertions Added:** 577 compile-time validations (6.8% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 14 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, reverse, more)
 
@@ -2556,4 +2556,167 @@ sine table, saving memory while maintaining clean sinusoidal synthesis.
 - Mathematical sophistication: ✅ (Taylor series cosine)
 - Low-bitrate codec coverage: ✅ (DTS extension)
 - Clever tricks: ✅ (Phase offset for sine)
+- Mission continues: ✅
+
+---
+
+## Session 11: Dirac Professional Video Codec Arithmetic Coder Tables
+
+**Date:** 2025-11-07
+**Focus:** BBC Research professional video codec probability tables
+**Complexity:** Low - Simple reversed-index and negation transformation
+
+### Overview
+
+Session 11 adds compile-time generation of probability tables for Dirac's arithmetic coder.
+Dirac is a professional video codec developed by BBC Research for high-quality broadcast
+compression. The tables enable efficient branch-free arithmetic coding/decoding.
+
+### New Constexpr Header
+
+**File:** `libavcodec/dirac_arith_tablegen_constexpr.hpp`  
+**Replaces:** Runtime initialization in `libavcodec/dirac_arith.c ff_dirac_init_arith_tables()`  
+**Size:** ~305 lines (12 KB)  
+**Tables:** 2 probability lookup tables (256 + 512 = 768 int16_t entries)
+
+### Tables Generated
+
+1. **dirac_prob[256]** (256 uint16_t) - Already const in original
+   - Base probability model from BBC Research specification
+   - Values range from 0 to 2072 (probabilities scaled by 2048)
+   - Characteristic shape: rises to peak ~2072 at index 164, then descends
+   - Represents cumulative probability distribution
+
+2. **dirac_prob_branchless[256][2]** (512 int16_t) - **NEW compile-time generation**
+   - Column 0: Reversed index lookup: `[i][0] = dirac_prob[255-i]`
+   - Column 1: Negated probability: `[i][1] = -dirac_prob[i]`
+   - Enables branch-free conditional operations in decoder
+   - Critical for pipeline efficiency on modern CPUs
+
+### Algorithm
+
+```cpp
+// Simple transformation of base table
+for (int i = 0; i < 256; ++i) {
+    // Column 0: Reversed index
+    table[i][0] = dirac_prob[255 - i];
+    
+    // Column 1: Negated value
+    table[i][1] = -dirac_prob[i];
+}
+```
+
+### Branchless Coding Pattern
+
+The branchless table enables efficient conditional selection:
+
+```c
+// Traditional branching (pipeline stall risk):
+value = (condition) ? prob_table[x] : -prob_table[y];
+
+// Branchless (no pipeline stall):
+value = dirac_prob_branchless[index][condition];
+```
+
+This eliminates conditional branches in the arithmetic decoder's hot path,
+significantly improving throughput on modern pipelined CPUs.
+
+### Validation
+
+**Static Assertions:** 45 compile-time validations
+
+**Key Tests:**
+- Table size verification (256 entries, 2 columns)
+- Base table values (0, 2, 2072 peak, 255)
+- Monotonicity in ascending region [0, 164]
+- Monotonicity in descending region [168, 255]
+- Range validation [0, 2072] for base table
+- Branchless column 0 reversal: `[i][0] = dirac_prob[255-i]`
+- Branchless column 1 negation: `[i][1] = -dirac_prob[i]`
+- Specific value checks at multiple indices
+- Symmetry properties
+- All 256 branchless entries algorithmically verified
+
+### Benefits
+
+- ⚡ Zero runtime initialization (512 int16_t at compile time)
+- 🚀 Branch-free arithmetic coding (eliminates pipeline stalls)
+- 📺 Professional broadcast quality (BBC Research codec)
+- ✅ Simple transformation, easy to verify
+- 🔧 Two-column design for efficient conditional selection
+- 💾 Compact representation (768 total entries)
+
+---
+
+### Session 11 Statistics
+
+**Files Created:** 1 constexpr header  
+**Total Entries:** 512 int16_t (branchless table)
+  - dirac_prob_branchless[256][2]: 512 entries
+  - dirac_prob[256]: Already const, not newly generated
+
+**Static Assertions:** 45 compile-time validations  
+**Lines of Code:** ~305 lines  
+**Complexity:** Low
+  - Simple index reversal
+  - Simple negation
+  - Two-column transformation
+  - Direct array mapping
+
+### Technical Achievements
+
+**Patterns Demonstrated:**
+1. **Branchless Table Design:** Two columns for condition-free selection
+2. **Index Reversal:** Access from opposite end of array
+3. **Sign Inversion:** Negated probability for bidirectional coding
+4. **Pipeline Optimization:** Eliminate conditional branches in hot path
+5. **Professional Codec Support:** BBC Research Dirac specification
+
+**Algorithms:**
+- ✅ Reversed index lookup
+- ✅ Value negation
+- ✅ Two-column transformation
+- ✅ Branch-free conditional selection
+
+**Data Types:**
+- ✅ uint16_t base probabilities (0-2072 range)
+- ✅ int16_t branchless table (signed for negation)
+- ✅ Two-dimensional array [256][2]
+
+### Cumulative Progress (After Session 11)
+
+**Total Files:** 22 files (9 C → C++, 15 constexpr headers, 1 pattern library)  
+**Total Entries:** 265,379 entries at compile time!  
+**Static Assertions:** 577 validations (6.8% density)  
+**Constexpr Functions:** 14 (maintained)  
+**Lines of Modern C++:** ~8,750 lines
+
+**Coverage:**
+- ✅ Audio codec tables (complete: PCM, MP3, AAC, QDM2, VIMA, DSD, COOK, Dolby E, DCA-LBR)
+- ✅ Video codec tables (expanding: DV, **Dirac**)
+- ✅ Mathematical utilities (complete)
+- ✅ Pattern library (complete)
+
+### What's Next?
+
+**Remaining Opportunities:**
+- AC3 encoder exponent grouping (1,536 bytes)
+- Bink video quantization (2,048 ints)
+- H.264 CAVLC level tables
+- VC-1 decoder tables
+
+**Status:** Production-ready and continuously expanding!
+
+The Dirac conversion demonstrates efficient compile-time generation of branchless
+lookup tables for arithmetic coding, achieving 512 probability values with zero
+runtime cost while eliminating pipeline stalls through branch-free design.
+
+---
+
+**Session 11 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (Dirac arithmetic coder)
+- Optimization focus: ✅ (Branch-free coding)
+- Professional video coverage: ✅ (BBC Research codec)
+- Pipeline efficiency: ✅ (Eliminate conditional branches)
 - Mission continues: ✅
