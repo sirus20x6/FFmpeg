@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 22 files (9 C → C++, 15 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~8,445 C++ lines + 710 lines documentation
-**Table Entries Generated:** 265,379 entries at compile time (563x growth!)
-**Static Assertions Added:** 577 compile-time validations (6.8% density)
+**Files Converted:** 23 files (9 C → C++, 16 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~8,720 C++ lines + 740 lines documentation
+**Table Entries Generated:** 266,915 entries at compile time (566x growth!)
+**Static Assertions Added:** 610 compile-time validations (7.0% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 14 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, reverse, more)
 
@@ -2719,4 +2719,174 @@ runtime cost while eliminating pipeline stalls through branch-free design.
 - Optimization focus: ✅ (Branch-free coding)
 - Professional video coverage: ✅ (BBC Research codec)
 - Pipeline efficiency: ✅ (Eliminate conditional branches)
+- Mission continues: ✅
+
+---
+
+## Session 12: AC-3 (Dolby Digital) Encoder Exponent Grouping Tables
+
+**Date:** 2025-11-07
+**Focus:** Dolby Digital encoder spectral envelope quantization
+**Complexity:** Low - Simple division-based grouping calculations
+
+### Overview
+
+Session 12 adds compile-time generation of exponent grouping tables for the AC-3
+(Dolby Digital) encoder. AC-3 is a perceptual audio codec widely used in cinema,
+broadcast, and home theater. The tables determine how spectral envelope exponents
+are grouped for efficient encoding.
+
+### New Constexpr Header
+
+**File:** `libavcodec/ac3enc_tablegen_constexpr.hpp`  
+**Replaces:** Runtime initialization in `libavcodec/ac3enc.c exponent_init()`  
+**Size:** ~275 lines (11 KB)  
+**Tables:** 1 three-dimensional exponent grouping table (1,536 uint8_t entries)
+
+### Table Generated
+
+**exponent_group_tab[2][3][256]** (1,536 bytes)
+- Dimension 0: Coupling mode (0=non-coupling, 1=coupling channel)
+- Dimension 1: Exponent strategy (0=D15, 1=D25, 2=D45)
+- Dimension 2: Number of coefficients (0-255)
+
+**Exponent Strategies:**
+- D15: grpsize = 3  (fine granularity, higher bitrate)
+- D25: grpsize = 6  (medium granularity, medium bitrate)
+- D45: grpsize = 12 (coarse granularity, lower bitrate)
+
+Strategy selection balances encoding precision vs. bitrate.
+
+### Algorithm
+
+```cpp
+// For each exponent strategy
+for (expstr = 0; expstr <= 2; ++expstr) {
+    int grpsize = 3 << expstr;  // 3, 6, or 12
+    
+    for (i = 12; i < 256; ++i) {
+        // Non-coupling: account for 4-coefficient offset
+        tab[0][expstr][i] = (i + grpsize - 4) / grpsize;
+        
+        // Coupling: simple division
+        tab[1][expstr][i] = i / grpsize;
+    }
+}
+
+// LFE (Low Frequency Effects) special case
+tab[0][0][7] = 2;
+```
+
+### Grouping Calculation
+
+For a given number of coefficients, the table provides the number of exponent groups:
+
+**Non-coupling channels:**
+- Formula: `(ncoefs + grpsize - 4) / grpsize`
+- The "-4" offset accounts for the AC-3 specification's coefficient organization
+
+**Coupling channels:**
+- Formula: `ncoefs / grpsize`
+- No offset, simple division
+
+**Example (D15, grpsize=3):**
+- 12 coefficients, non-coupling: (12+3-4)/3 = 11/3 = 3 groups
+- 12 coefficients, coupling: 12/3 = 4 groups
+
+### Validation
+
+**Static Assertions:** 33 compile-time validations
+
+**Key Tests:**
+- Table dimensions [2][3][256]
+- LFE special case: tab[0][0][7] = 2
+- D15 calculations (grpsize=3) for both coupling modes
+- D25 calculations (grpsize=6) for both coupling modes
+- D45 calculations (grpsize=12) for both coupling modes
+- Zero initialization below i=12
+- Monotonicity: groups increase with coefficient count
+- Coupling vs non-coupling differences
+- Boundary value verification
+
+### Benefits
+
+- ⚡ Zero runtime initialization (1,536 bytes at compile time)
+- 🎬 Dolby Digital encoder efficiency (cinema/broadcast standard)
+- 📊 Three strategy levels for bitrate/quality tradeoff
+- ✅ Simple division algorithm, easy to verify
+- 🔧 Separate coupling channel handling
+- 💾 Compact 3D lookup table
+
+---
+
+### Session 12 Statistics
+
+**Files Created:** 1 constexpr header  
+**Total Entries:** 1,536 uint8_t
+  - exponent_group_tab[2][3][256]: 1,536 bytes
+
+**Static Assertions:** 33 compile-time validations  
+**Lines of Code:** ~275 lines  
+**Complexity:** Low
+  - Simple division calculations
+  - Three grouping strategies
+  - Coupling mode handling
+  - One special case (LFE)
+
+### Technical Achievements
+
+**Patterns Demonstrated:**
+1. **Three-Dimensional Tables:** Multi-mode lookup structure
+2. **Strategy-Based Grouping:** Flexible bitrate/quality control
+3. **Offset Calculations:** AC-3 spec coefficient organization
+4. **Special Case Handling:** LFE channel override
+5. **Coupling Mode Support:** Separate formulas for channel types
+
+**Algorithms:**
+- ✅ Division-based grouping
+- ✅ Offset calculations for spec compliance
+- ✅ Multi-strategy support (D15/D25/D45)
+- ✅ Coupling vs non-coupling differentiation
+
+**Data Types:**
+- ✅ uint8_t compact storage
+- ✅ Three-dimensional array [2][3][256]
+- ✅ Group count lookups (1-85 range)
+
+### Cumulative Progress (After Session 12)
+
+**Total Files:** 23 files (9 C → C++, 16 constexpr headers, 1 pattern library)  
+**Total Entries:** 266,915 entries at compile time!  
+**Static Assertions:** 610 validations (7.0% density)  
+**Constexpr Functions:** 14 (maintained)  
+**Lines of Modern C++:** ~9,000 lines
+
+**Coverage:**
+- ✅ Audio codec tables (complete: PCM, MP3, AAC, QDM2, VIMA, DSD, COOK, Dolby E, DCA-LBR, **AC-3 encoder**)
+- ✅ Video codec tables (expanding: DV, Dirac)
+- ✅ Mathematical utilities (complete)
+- ✅ Pattern library (complete)
+
+### What's Next?
+
+**Remaining Opportunities:**
+- Bink video quantization (2,048 ints)
+- H.264 CAVLC level tables
+- EAC3 encoder tables
+- More AC-3/E-AC-3 tables
+
+**Status:** Production-ready and continuously expanding!
+
+The AC-3 encoder conversion demonstrates compile-time generation of multi-dimensional
+grouping tables for spectral envelope quantization, achieving 1,536 lookup values
+with zero runtime cost while supporting flexible bitrate/quality strategies.
+
+---
+
+**Session 12 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (AC-3 encoder exponent grouping)
+- Dolby Digital support: ✅ (Cinema/broadcast/home theater)
+- Strategy flexibility: ✅ (D15/D25/D45 for bitrate control)
+- Coupling modes: ✅ (Separate handling for channel types)
 - Mission continues: ✅
