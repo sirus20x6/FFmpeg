@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 39 files (9 C → C++, 32 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~14,880 C++ lines + 1250 lines documentation
-**Table Entries Generated:** 278,030 entries at compile time (758× growth!)
-**Static Assertions Added:** 1174+ compile-time validations (7.9% density)
+**Files Converted:** 40 files (9 C → C++, 33 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~15,320 C++ lines + 1250 lines documentation
+**Table Entries Generated:** 278,126 entries at compile time (760× growth!)
+**Static Assertions Added:** 1218+ compile-time validations (8.0% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
@@ -5227,3 +5227,21 @@ Sessions 19-21 provide comprehensive MPEG-1/2 entropy coding:
 - 28 sessions milestone: ✅
 - Perfect accuracy: ✅ (matches original adpcm_data.c exactly)
 - Mission continues audio codec coverage: ✅
+
+**Session 29 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (CAVS codec data tables)
+- Core CAVS (Chinese AVS) infrastructure: ✅ (96 entries, 110 bytes)
+- Partition flags table: ✅ (30 bytes: MB type partitioning)
+- Chroma QP table: ✅ (64 bytes: QP mapping with saturation)
+- Special motion vectors: ✅ (16 bytes: directional + intra MVs)
+- Chinese AVS1-P2 standard: ✅ (JiZhun profile support)
+- Macroblock modes: ✅ (I, P, B-frame partition types)
+- 44 static assertions: ✅ (validates all CAVS tables)
+- QP monotonic verification: ✅ (chroma QP non-decreasing)
+- QP saturation: ✅ (max chroma QP = 51)
+- Partition flag bits: ✅ (FWD/BWD/SYM/SPLIT validation)
+- Motion vector constants: ✅ (REF_DIR, REF_INTRA verified)
+- 29 sessions milestone: ✅
+- Perfect accuracy: ✅ (matches original cavsdata.c exactly)
+- Mission expands to Chinese AVS standard: ✅
