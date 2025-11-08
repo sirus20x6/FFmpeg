@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 27 files (9 C → C++, 20 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~10,170 C++ lines + 770 lines documentation
-**Table Entries Generated:** 273,339 entries at compile time (585× growth!)
-**Static Assertions Added:** 813+ compile-time validations (8.0% density)
+**Files Converted:** 28 files (9 C → C++, 21 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~10,510 C++ lines + 770 lines documentation
+**Table Entries Generated:** 273,499 entries at compile time (586× growth!)
+**Static Assertions Added:** 843+ compile-time validations (8.0% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
@@ -3791,4 +3791,278 @@ With Sessions 14-16, H.264 quantization is complete:
 - Spec compliance: ✅ (H.264 Table 8-15)
 - All bit depths supported: ✅ (8-14 bit)
 - Compilation errors fixed: ✅
+- Mission continues: ✅
+
+---
+
+## Session 17: HEVC Diagonal Scan Tables
+
+**Date:** 2025-11-08
+**Focus:** Compile-time generation of HEVC/H.265 diagonal scan patterns
+**Impact:** First HEVC tables - beginning modernization of H.264's successor
+
+### Overview
+
+Session 17 adds compile-time generation of HEVC (High Efficiency Video Coding, also known as H.265) diagonal scan tables. These tables define the scan order for transform coefficients in HEVC's entropy coding, enabling efficient run-length coding of sparse coefficient data by grouping low-frequency coefficients together.
+
+### What are Diagonal Scan Tables?
+
+HEVC uses diagonal scan patterns to traverse transform coefficient blocks:
+
+**4×4 Block Scan Order:**
+```
+   x: 0  1  2  3
+ y  +------------
+ 0  | 0  2  5  9     Scan diagonally from top-left to bottom-right
+ 1  | 1  4  8 12     Each diagonal has constant sum(x+y)
+ 2  | 3  7 11 14     Within diagonal: traverse bottom-left to top-right
+ 3  | 6 10 13 15
+```
+
+**Purpose:**
+- **DC coefficient first**: Most important (lowest frequency) coefficient at position 0
+- **Diagonal ordering**: Groups similar-frequency coefficients together
+- **Sparse coding**: Most high-frequency coefficients are zero, so grouping them enables efficient run-length encoding
+- **Optimal compression**: Scan order minimizes bits needed to encode coefficient positions
+
+### New File Created
+
+#### libavcodec/hevc/data_constexpr.hpp
+**Entries:** 160 bytes (4 tables: 2 × 16 + 2 × 64)
+**Type:** HEVC diagonal scan coordinate tables
+
+**What It Does:**
+Generates diagonal scan patterns for HEVC transform blocks:
+- **4×4 scan**: 16 positions (x,y coordinates)
+- **8×8 scan**: 64 positions (x,y coordinates)
+- **Algorithmic generation**: Diagonal traversal with compile-time validation
+
+**Algorithm:**
+```cpp
+template<int SIZE>
+constexpr auto generate_hevc_diag_scan() noexcept {
+    struct ScanPair {
+        std::array<uint8_t, SIZE * SIZE> x;
+        std::array<uint8_t, SIZE * SIZE> y;
+    };
+
+    ScanPair tables{};
+    int scan_idx = 0;
+
+    // Iterate through all diagonals (sum from 0 to 2*SIZE-2)
+    for (int diag_sum = 0; diag_sum < 2 * SIZE - 1; ++diag_sum) {
+        // Within each diagonal, iterate from bottom to top
+        int start_y = (diag_sum < SIZE) ? diag_sum : SIZE - 1;
+
+        for (int y = start_y; y >= 0; --y) {
+            int x = diag_sum - y;
+
+            if (x < SIZE && y < SIZE) {
+                tables.x[scan_idx] = static_cast<uint8_t>(x);
+                tables.y[scan_idx] = static_cast<uint8_t>(y);
+                ++scan_idx;
+            }
+        }
+    }
+
+    return tables;
+}
+```
+
+**Key Properties:**
+1. **Generic template**: Same algorithm works for any block size
+2. **Diagonal sum invariant**: Points on same diagonal have x+y=constant
+3. **Monotonic diagonals**: Diagonal sum never decreases along scan order
+4. **Complete coverage**: All SIZE×SIZE positions visited exactly once
+
+### Session 17 Statistics
+
+**Files Created:** 1 constexpr header
+**Total Entries:** 160 bytes (16+16+64+64)
+**Static Assertions:** 30+ compile-time validations
+**Lines of Code:** ~340 lines
+**Complexity:** Low (simple diagonal traversal)
+
+### Technical Achievements
+
+**Comprehensive Validation:**
+The static assertions verify:
+- **Uniqueness**: No position (x,y) appears twice ✓
+- **Completeness**: All positions from (0,0) to (SIZE-1,SIZE-1) covered ✓
+- **Diagonal order**: Sum x+y is non-decreasing along scan ✓
+- **Boundary conditions**: All coordinates < SIZE ✓
+- **Corner positions**: DC at (0,0), last coefficient at (SIZE-1,SIZE-1) ✓
+
+**Verification Functions:**
+```cpp
+constexpr auto verify_4x4_uniqueness() {
+    std::array<bool, 16> seen{};
+    for (int i = 0; i < 16; ++i) {
+        int pos = hevc_diag_scan4x4_x[i] * 4 + hevc_diag_scan4x4_y[i];
+        if (seen[pos]) return false;  // Duplicate!
+        seen[pos] = true;
+    }
+    return true;  // All unique
+}
+static_assert(verify_4x4_uniqueness(), "4×4: All positions are unique");
+```
+
+**Algorithm Properties:**
+- ✅ Template-based (generic for any SIZE)
+- ✅ O(N²) generation time at compile-time (N = SIZE)
+- ✅ Perfect accuracy (matches original tables exactly)
+- ✅ Self-documenting (diagonal traversal is explicit)
+- ✅ Zero runtime overhead
+
+### Cumulative Progress (After Session 17)
+
+**Total Files:** 28 files (9 C → C++, 21 constexpr headers, 1 pattern library)
+**Total Entries:** 273,499 entries at compile time! (160 new)
+**Static Assertions:** 843+ validations (30 new)
+**Constexpr Functions:** 15 (log2, pow2, trigonometric, more)
+**Lines of Modern C++:** ~10,510 lines (~340 new)
+
+**Codec Coverage:**
+- ✅ Audio: MP3, AAC, QDM2, G.711, G.729, Dolby E, DCA-LBR, Opus, Vorbis, AC-3, WMA, COOK
+- ✅ Video: Motion Pixels, DV, Dirac, H.264 (CAVLC + QP + Chroma QP), **HEVC (scan)**, Bink
+- ✅ Mathematical utilities (complete)
+
+**Video Codec Progression:**
+- ✅ H.264: Sessions 14-16 (quantization trilogy)
+- ✅ HEVC: Session 17 (diagonal scan) ← **NEW!**
+- Next: More HEVC tables, VP9, AV1...
+
+### Why This Matters
+
+**HEVC Context:**
+HEVC (H.265) is the successor to H.264:
+- **50% better compression** than H.264 at same quality
+- Used in: 4K/8K video, streaming (Netflix, YouTube), Blu-ray UHD
+- More complex than H.264, but same fundamental principles
+- Diagonal scan is part of entropy coding pipeline
+
+**Scan Order Impact:**
+```
+Without diagonal scan (raster order):
+  DC, AC01, AC02, AC03, AC10, AC11, ...
+  Random mix of zero and non-zero coefficients
+
+With diagonal scan:
+  DC, AC01, AC10, AC20, AC11, AC02, ...
+  Non-zero coefficients clustered at start
+  Long runs of zeros at end
+  → Better run-length coding efficiency
+```
+
+**Performance:**
+- Used for every transform block during decoding
+- Millions of lookups per frame in 4K video
+- O(1) array lookup vs. computing coordinates on-the-fly
+- Zero initialization overhead
+
+### Technical Deep Dive: Diagonal Scan Algorithm
+
+**Why diagonal traversal?**
+
+Transform coefficients in frequency domain:
+```
+Low freq  →  High freq
+   ↓
+High
+freq
+
+Energy distribution after DCT/DST:
+  [DC  AC01 AC02 AC03 ...]
+   ↓    ↓    ↓    ↓
+  High  ↓    ↓    ↓
+  Med   ↓    ↓    ↓
+  Med   ↓    ↓    Low
+  Low  Low  Low  Low
+
+Most energy in top-left corner (low frequencies)
+Least energy in bottom-right corner (high frequencies)
+```
+
+**Diagonal scan strategy:**
+1. Start at DC (0,0) - highest energy
+2. Proceed along diagonals - gradually increasing frequency
+3. End at (SIZE-1,SIZE-1) - lowest energy (likely zero)
+
+**Result:** Natural ordering for run-length coding of sparse data.
+
+**Generic Template Design:**
+
+The algorithm works for any block size:
+```cpp
+// 4×4 scan: 7 diagonals (0 to 6)
+//   Diagonal 0: (0,0)
+//   Diagonal 1: (0,1), (1,0)
+//   Diagonal 2: (0,2), (1,1), (2,0)
+//   ...
+//   Diagonal 6: (3,3)
+
+// 8×8 scan: 15 diagonals (0 to 14)
+// 16×16 scan: 31 diagonals (0 to 30)
+// Pattern: 2*SIZE-1 diagonals total
+```
+
+This template-based approach means adding 16×16 or 32×32 scans requires zero new code!
+
+### Lessons Learned
+
+**Template-Based Table Generation:**
+Session 17 introduces template-based generation:
+- Single algorithm generates multiple sizes
+- Type-safe SIZE parameter
+- Compiler optimizes each instantiation separately
+- Future sizes (16×16, 32×32) trivial to add
+
+**Constexpr Validation Functions:**
+First session to use constexpr helper functions for validation:
+```cpp
+constexpr auto verify_uniqueness() { ... }
+static_assert(verify_uniqueness(), "...");
+```
+This pattern is more powerful than inline assertions - enables complex logic at compile-time.
+
+**Small But Important:**
+160 bytes might seem tiny, but:
+- Foundation for HEVC modernization
+- Demonstrates template-based approach
+- Used millions of times during video decoding
+- Proves constexpr works for modern video codecs (HEVC)
+
+### What's Next?
+
+**HEVC Expansion:**
+Session 17 is just the beginning for HEVC:
+- ✅ Diagonal scan patterns (Session 17)
+- ⏳ CABAC context tables
+- ⏳ Quantization matrices
+- ⏳ Deblocking filter tables
+- ⏳ SAO (Sample Adaptive Offset) tables
+
+**Other Modern Codecs:**
+- VP9 tables (Google's codec)
+- AV1 tables (next-gen open codec)
+- VVC/H.266 tables (HEVC successor)
+
+**Modernization Milestone:**
+- 28 files across 17 sessions
+- 273,499 compile-time entries
+- 843+ static assertions
+- H.264 trilogy complete (Sessions 14-16)
+- HEVC begun (Session 17)
+- Zero-overhead principle maintained!
+
+---
+
+**Session 17 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (HEVC diagonal scan)
+- HEVC modernization: ✅ BEGUN
+- Template-based generation: ✅ (generic algorithm)
+- Constexpr validation functions: ✅ (new pattern)
+- Perfect accuracy: ✅ (matches original exactly)
+- Video codec expansion: ✅ (H.264 → HEVC)
 - Mission continues: ✅
