@@ -2,7 +2,7 @@
 
 This document tracks the progress of the FFmpeg modernization effort, documenting completed conversions and identified opportunities.
 
-**Last Updated:** 2025-11-07
+**Last Updated:** 2025-11-08
 **Branch:** `claude/modernize-ffmpeg-cmake-011CUtjjuv91a5ojd2rbzbGS`
 
 ---
@@ -13,12 +13,12 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 24 files (9 C → C++, 17 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~9,050 C++ lines + 770 lines documentation
-**Table Entries Generated:** 268,963 entries at compile time (571x growth!)
-**Static Assertions Added:** 638 compile-time validations (7.0% density)
+**Files Converted:** 25 files (9 C → C++, 18 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~9,670 C++ lines + 770 lines documentation
+**Table Entries Generated:** 272,547 entries at compile time (579x growth!)
+**Static Assertions Added:** 688 compile-time validations (7.1% density)
 **Runtime Overhead:** Zero (verified identical assembly)
-**Constexpr Math Functions:** 14 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, reverse, more)
+**Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
 ---
 
@@ -3055,4 +3055,254 @@ with zero runtime cost while maintaining game industry codec standards.
 - Game codec support: ✅ (RAD Game Tools industry standard)
 - Fixed-point arithmetic: ✅ (64-bit intermediate precision)
 - Scan reordering: ✅ (Inverse lookup generation)
+- Mission continues: ✅
+
+---
+
+## Session 14: H.264 CAVLC Level Decoding Tables
+
+**Date:** 2025-11-08
+**Focus:** Compile-time generation of H.264 variable-length code decoding tables
+**Impact:** One of the world's most important video codecs now benefits from zero-overhead table initialization
+
+### Overview
+
+Session 14 adds compile-time generation of CAVLC (Context-Adaptive Variable Length Coding) level decoding lookup tables for the H.264/AVC video codec. H.264 is one of the most widely deployed video compression standards, used in everything from Blu-ray discs to YouTube and video conferencing.
+
+### What is CAVLC?
+
+CAVLC is H.264's entropy coding method for transform coefficients (an alternative to CABAC). It uses variable-length codes that adapt based on context, requiring lookup tables for efficient decoding. The level tables accelerate coefficient level decoding by pre-computing values and bit lengths for different VLC code structures.
+
+### New File Created
+
+#### libavcodec/h264_cavlc_tablegen_constexpr.hpp
+**Entries:** 3,584 int8_t (7 × 256 × 2)
+**Type:** H.264 CAVLC level decoding lookup tables
+
+**What It Does:**
+Generates complete lookup tables for decoding CAVLC level codes. For each of 7 suffix lengths and 256 possible bit patterns, pre-computes:
+- The decoded coefficient level value
+- The number of bits consumed from the bitstream
+
+**Algorithm Highlights:**
+```cpp
+// 1. Constexpr log2 for bit length calculations
+constexpr int log2_constexpr(unsigned int x) noexcept {
+    int result = 0;
+    unsigned int temp = x;
+    while (temp >>= 1) ++result;
+    return result;
+}
+
+// 2. For each (suffix_length, bit_pattern) combination:
+for (int suffix_length = 0; suffix_length < 7; ++suffix_length) {
+    for (unsigned int i = 0; i < 256; ++i) {
+        // Calculate prefix from bit pattern
+        int prefix = 8 - log2_constexpr(2 * i);
+
+        // Case 1: Full code fits in 8 bits
+        if (prefix + 1 + suffix_length <= 8) {
+            // Extract suffix bits
+            int suffix_bits = (i >> (log2_i - suffix_length));
+            int level_code = (prefix << suffix_length) + suffix_bits - (1 << suffix_length);
+
+            // Sign handling: odd=negative, even=positive
+            int mask = -(level_code & 1);
+            level_code = (((2 + level_code) >> 1) ^ mask) - mask;
+
+            table[suffix_length][i][0] = level_code;
+            table[suffix_length][i][1] = prefix + 1 + suffix_length;
+        }
+        // Case 2: Need more suffix bits (marker: prefix + 100)
+        else if (prefix + 1 <= 8) {
+            table[suffix_length][i][0] = prefix + 100;
+            table[suffix_length][i][1] = prefix + 1;
+        }
+        // Case 3: Overflow (marker: 108)
+        else {
+            table[suffix_length][i][0] = 108;
+            table[suffix_length][i][1] = 8;
+        }
+    }
+}
+```
+
+**Key Innovations:**
+1. **Constexpr log2:** Efficient compile-time logarithm for prefix calculation
+2. **Sign bit handling:** Converts VLC representation to signed coefficients
+3. **Special markers:** Encodes when additional bits are needed (prefix + 100) or overflow (108)
+4. **Bit-exact compatibility:** Matches original runtime algorithm perfectly
+
+### Session 14 Statistics
+
+**Files Created:** 1 constexpr header
+**Total Entries:** 3,584 int8_t entries (7 suffix lengths × 256 patterns × 2 values)
+**Static Assertions:** 50 compile-time validations
+**Lines of Code:** ~290 lines
+**Complexity:** Medium
+  - Custom constexpr log2 implementation
+  - Multi-case conditional logic
+  - Sign bit manipulation
+  - Special marker encoding
+
+### Technical Achievements
+
+**New Capabilities:**
+1. **Constexpr Logarithm:** First use of compile-time integer log2
+2. **VLC Table Generation:** Variable-length code lookup table construction
+3. **Sign Encoding:** Compact positive/negative value representation
+4. **Overflow Handling:** Graceful degradation for codes requiring extra bits
+
+**Validation Coverage:**
+- Log2 function correctness (8 tests across powers of 2)
+- Table dimensions and structure (3 tests)
+- Specific entry values (15+ spot checks)
+- Special markers (overflow: 108, need-more-bits: prefix+100)
+- Sign handling (positive and negative levels)
+- Bit length consistency checks
+- Boundary condition validation
+
+**Algorithm Properties:**
+- ✅ O(1) decode lookup (replaces bit-by-bit parsing)
+- ✅ Handles 7 different VLC code structures
+- ✅ Supports both positive and negative coefficient levels
+- ✅ Gracefully handles codes requiring >8 bits
+- ✅ Zero runtime initialization overhead
+
+### Cumulative Progress (After Session 14)
+
+**Total Files:** 25 files (9 C → C++, 18 constexpr headers, 1 pattern library)
+**Total Entries:** 272,547 entries at compile time!
+**Static Assertions:** 688 validations (continuing high density)
+**Constexpr Functions:** 15+ (added log2_constexpr)
+**Lines of Modern C++:** ~9,670 lines
+
+**Codec Coverage:**
+- ✅ Audio: MP3, AAC, QDM2, G.711, G.729, Dolby E, DCA-LBR, Opus, Vorbis, AC-3, WMA
+- ✅ Video: Motion Pixels, DV, Dirac, **H.264 CAVLC**, Bink
+- ✅ Mathematical utilities (complete)
+
+### Why This Matters
+
+**H.264 Impact:**
+H.264/AVC is arguably the most important video codec in history:
+- **Blu-ray standard:** Every Blu-ray disc uses H.264
+- **Streaming:** YouTube, Netflix, Hulu all extensively use H.264
+- **Broadcasting:** ATSC, DVB-T2, ISDB-T digital TV standards
+- **Video conferencing:** Zoom, Teams, WebRTC
+- **Mobile:** iOS and Android native support
+- **Cameras:** Most digital cameras and phones record H.264
+
+**Performance Benefits:**
+- Table lookup is now O(1) with zero overhead
+- No runtime initialization required
+- All 3,584 entries in .rodata section
+- Compile-time validation prevents regression
+- Enables further optimization by compilers
+
+**Code Quality:**
+- 50 static assertions ensure correctness
+- Each of 7 suffix lengths thoroughly tested
+- Sign handling validated
+- Special cases (overflow, need-more-bits) verified
+- Bit-exact compatibility with original algorithm
+
+### Codec Context: CAVLC vs CABAC
+
+H.264 supports two entropy coding methods:
+
+**CAVLC (Context-Adaptive Variable Length Coding):**
+- Simpler, faster, lower compression
+- Uses VLC codes that adapt based on context
+- Baseline Profile (used in video conferencing)
+- This session covers CAVLC level tables
+
+**CABAC (Context-Adaptive Binary Arithmetic Coding):**
+- More complex, better compression
+- Main/High Profiles (Blu-ray, streaming)
+- Not using VLC tables (arithmetic coding instead)
+
+CAVLC remains important for:
+- Real-time applications (lower latency)
+- Hardware implementations (simpler logic)
+- Baseline Profile devices
+- Backward compatibility
+
+### Technical Deep Dive: Sign Encoding
+
+The sign handling algorithm is elegant:
+
+```cpp
+// level_code values: 0, 1, 2, 3, 4, 5, ...
+// Want to encode: 1, -1, 2, -2, 3, -3, ...
+
+int mask = -(level_code & 1);  // -1 if odd, 0 if even
+level_code = (((2 + level_code) >> 1) ^ mask) - mask;
+
+// Example: level_code = 0
+// mask = 0, result = ((2+0)>>1) ^ 0 - 0 = 1 ✓
+
+// Example: level_code = 1
+// mask = -1, result = ((2+1)>>1) ^ -1 - (-1) = 1 ^ -1 + 1 = -2 + 1 = -1 ✓
+
+// Example: level_code = 2
+// mask = 0, result = ((2+2)>>1) ^ 0 - 0 = 2 ✓
+
+// Example: level_code = 3
+// mask = -1, result = ((2+3)>>1) ^ -1 - (-1) = 2 ^ -1 + 1 = -3 + 1 = -2 ✓
+```
+
+This branchless encoding maps sequential VLC codes to alternating signed values!
+
+### Lessons Learned
+
+**Integer Logarithm:**
+Constexpr log2 is straightforward with bit shifting:
+```cpp
+constexpr int log2_constexpr(unsigned int x) noexcept {
+    int result = 0;
+    unsigned int temp = x;
+    while (temp >>= 1) ++result;
+    return result;
+}
+```
+
+**Static Assertion Pitfalls:**
+Avoid tautological assertions that trigger warnings:
+```cpp
+// Bad: Always true for int8_t
+static_assert(value >= -128 && value <= 127, "In range");
+
+// Good: Test actual computed values
+static_assert(cavlc_level_tab[0][1][0] == 4, "Specific value check");
+```
+
+**Marker Encoding:**
+Using special values (prefix + 100, LEVEL_TAB_BITS + 100) elegantly signals when additional processing is needed without adding extra fields.
+
+### What's Next?
+
+**Remaining Opportunities:**
+- AAC PS Fixed tables (complex, requires SoftFloat constexpr)
+- Additional H.264 tables (CABAC, prediction weights)
+- More video codec VLC tables (VC-1, VP8/VP9)
+- JPEG/MPEG quantization matrices
+- DSP filter coefficient tables
+
+**Modernization Status:**
+- 25 files modernized across 14 sessions
+- 272,547 compile-time table entries (579x growth from initial 470!)
+- Every major table generation pattern demonstrated
+- Production-ready and continuously expanding
+
+---
+
+**Session 14 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (H.264 CAVLC level tables)
+- World's most important video codec: ✅
+- Constexpr log2: ✅ (new mathematical function)
+- VLC decoding acceleration: ✅
+- Sign encoding: ✅ (elegant branchless algorithm)
+- 50 static assertions: ✅
 - Mission continues: ✅
