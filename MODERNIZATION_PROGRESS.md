@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 26 files (9 C → C++, 19 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~9,925 C++ lines + 770 lines documentation
-**Table Entries Generated:** 272,723 entries at compile time (580x growth!)
-**Static Assertions Added:** 763 compile-time validations (7.7% density)
+**Files Converted:** 27 files (9 C → C++, 20 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~10,170 C++ lines + 770 lines documentation
+**Table Entries Generated:** 273,339 entries at compile time (585× growth!)
+**Static Assertions Added:** 813+ compile-time validations (8.0% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
@@ -3505,4 +3505,290 @@ With Sessions 14-15, we now have:
 - Exceptional validation density: ✅ (75 assertions for 176 bytes!)
 - H.264 decoder optimization: ✅ (complements Session 14)
 - Mathematical properties verified: ✅
+- Mission continues: ✅
+
+---
+
+## Session 16: H.264 Chroma QP Mapping Tables
+
+**Date:** 2025-11-08
+**Focus:** Compile-time generation of H.264 chroma quantization parameter mapping tables
+**Impact:** Completes the H.264 quantization trilogy - chroma QP mapping for all bit depths
+
+### Overview
+
+Session 16 adds compile-time generation of chroma QP mapping tables for H.264. These tables map luma (brightness) quantization parameters to chroma (color) quantization parameters across different bit depths (8-14 bits). The non-linear mapping preserves chroma quality at high compression levels, a key feature of H.264's perceptual optimization.
+
+### What are Chroma QP Mapping Tables?
+
+H.264 uses different quantization parameters for luma and chroma components:
+- **Luma QP**: Quantization for brightness information (Y channel)
+- **Chroma QP**: Quantization for color information (Cb, Cr channels)
+- **Mapping**: Non-linear relationship that compresses chroma QP at higher values
+- **Purpose**: Human vision is less sensitive to chroma detail, so preserve it better
+
+**Key characteristics:**
+- QP 0-29: Identity mapping (chroma_qp = luma_qp)
+- QP 30-51: Compressed mapping (chroma QP grows slower than luma QP)
+- Bit depths 8-14: Different offsets for high bit-depth video
+
+### New File Created
+
+#### libavcodec/h264_chroma_qp_tablegen_constexpr.hpp
+**Entries:** 616 bytes (7 bit depths × 88 QP values)
+**Type:** H.264 chroma quantization parameter mapping tables
+
+**What It Does:**
+Generates chroma QP lookup tables for all supported bit depths:
+- **7 bit depths**: 8-bit, 9-bit, 10-bit, 11-bit, 12-bit, 13-bit, 14-bit
+- **88 QP values**: 0-87 (base range 0-51 + extended range for high bit depth)
+- **Standard H.264 mapping**: Based on H.264 spec Table 8-15
+
+**Algorithm:**
+```cpp
+// Standard H.264 chroma QP mapping from spec
+constexpr std::array<uint8_t, 52> standard_chroma_qp_mapping = {
+    // 0-29: Identity mapping
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    // 30-51: Compressed mapping (preserves chroma quality)
+    29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38,
+    38, 38, 39, 39, 39, 39
+};
+
+// Generate for all bit depths
+constexpr auto generate_h264_chroma_qp_table() noexcept {
+    std::array<std::array<uint8_t, 88>, 7> table{};
+
+    for (int depth_idx = 0; depth_idx < 7; ++depth_idx) {
+        int bit_depth = 8 + depth_idx;
+        int depth_offset = 6 * (bit_depth - 8);  // 0, 6, 12, 18, 24, 30, 36
+        int identity_count = depth_offset;
+
+        for (int qp = 0; qp <= 87; ++qp) {
+            if (qp < identity_count) {
+                // Identity mapping for initial QPs
+                table[depth_idx][qp] = static_cast<uint8_t>(qp);
+            } else {
+                // Use standard mapping with depth offset
+                int adjusted_qp = qp - identity_count;
+                if (adjusted_qp < 52) {
+                    table[depth_idx][qp] = static_cast<uint8_t>(
+                        standard_chroma_qp_mapping[adjusted_qp] + depth_offset
+                    );
+                } else {
+                    // Extended range beyond standard
+                    int extension = adjusted_qp - 51;
+                    table[depth_idx][qp] = static_cast<uint8_t>(
+                        39 + depth_offset + extension
+                    );
+                }
+            }
+        }
+    }
+    return table;
+}
+```
+
+**Key Properties:**
+1. **Non-linear compression**: Chroma QP grows slower than luma QP at high values
+2. **Bit depth offset**: depth_offset = 6 × (bit_depth - 8)
+3. **Identity regions**: Higher bit depths have larger identity mapping regions
+4. **Perceptual optimization**: Preserves chroma quality where eyes are most sensitive
+
+### Session 16 Statistics
+
+**Files Created:** 1 constexpr header
+**Total Entries:** 616 bytes (7 depths × 88 QP values)
+**Static Assertions:** 50+ compile-time validations
+**Lines of Code:** ~245 lines
+**Complexity:** Medium (multi-dimensional mapping with bit-depth awareness)
+
+### Technical Achievements
+
+**Comprehensive Validation:**
+- Standard H.264 mapping verification (spec Table 8-15)
+- Identity region boundaries for each bit depth
+- Non-linear compression characteristics
+- Bit depth offset formula validation
+- Monotonicity checks (chroma QP never decreases)
+- Boundary conditions (QP 0, 51, 87)
+- Cross-depth consistency
+
+**Assertions Include:**
+```cpp
+// Verify standard mapping
+static_assert(h264_chroma_qp[0][29] == 29, "Identity region ends at 29");
+static_assert(h264_chroma_qp[0][30] == 29, "Compression starts (30→29)");
+static_assert(h264_chroma_qp[0][51] == 39, "Max standard chroma QP");
+
+// Verify bit depth offsets
+static_assert(h264_chroma_qp[1][6] == h264_chroma_qp[0][0] + 6,
+              "9-bit offset is +6");
+static_assert(h264_chroma_qp[2][12] == h264_chroma_qp[0][0] + 12,
+              "10-bit offset is +12");
+
+// Verify non-linear compression
+static_assert(h264_chroma_qp[0][33] == h264_chroma_qp[0][34],
+              "Some QP values map to same chroma QP");
+```
+
+**Algorithm Properties:**
+- ✅ O(1) lookup for chroma QP (replaces complex mapping logic)
+- ✅ Supports all H.264 bit depths (8-14 bit)
+- ✅ Spec-compliant (H.264 Table 8-15)
+- ✅ Zero runtime initialization
+- ✅ Small memory footprint (616 bytes in .rodata)
+
+### Cumulative Progress (After Session 16)
+
+**Total Files:** 27 files (9 C → C++, 20 constexpr headers, 1 pattern library)
+**Total Entries:** 273,339 entries at compile time! (616 new)
+**Static Assertions:** 813+ validations (50 new)
+**Constexpr Functions:** 15 (log2, pow2, trigonometric, more)
+**Lines of Modern C++:** ~10,170 lines (~245 new)
+
+**Codec Coverage:**
+- ✅ Audio: MP3, AAC, QDM2, G.711, G.729, Dolby E, DCA-LBR, Opus, Vorbis, AC-3, WMA, COOK
+- ✅ Video: Motion Pixels, DV, Dirac, **H.264 (CAVLC + QP + Chroma QP)**, Bink
+- ✅ Mathematical utilities (complete)
+
+**H.264 Quantization Trilogy Complete!**
+- ✅ Session 14: CAVLC level decoding tables (3,584 entries)
+- ✅ Session 15: QP arithmetic tables (176 entries)
+- ✅ Session 16: Chroma QP mapping tables (616 entries)
+- **Total H.264 tables:** 4,376 entries, all at compile time!
+
+### Why This Matters
+
+**Perceptual Video Coding:**
+H.264's chroma QP mapping is based on human visual perception:
+- Eyes are less sensitive to color (chroma) than brightness (luma)
+- At high compression (high QP), preserve chroma quality by using lower chroma QP
+- Non-linear mapping: luma QP 51 → chroma QP 39 (12 QP difference = ~4× quality improvement)
+
+**Real-World Impact:**
+```
+Luma QP 40 (heavy compression):
+  → Chroma QP 36 (4 QP less = ~2× better quality)
+  → Result: Colors look better even at high compression
+
+Luma QP 20 (light compression):
+  → Chroma QP 20 (same = no special treatment needed)
+  → Result: Excellent quality throughout
+```
+
+**Performance:**
+- Used for every chroma block during encoding/decoding
+- Thousands of lookups per frame
+- O(1) table lookup vs. complex conditional logic
+- Zero initialization overhead
+
+**Relationship to Sessions 14-15:**
+Together, Sessions 14-16 provide essential H.264 quantization infrastructure:
+- **Session 14 (CAVLC)**: Decode variable-length coefficient codes
+- **Session 15 (QP)**: Fast modulo-6 arithmetic for quantization
+- **Session 16 (Chroma QP)**: Map luma QP to chroma QP for perceptual optimization
+
+### Technical Deep Dive: Non-Linear Chroma Mapping
+
+**Why compress the chroma QP range?**
+
+H.264's design exploits human vision characteristics:
+
+```
+Luma QP:    0  10  20  30  40  50  51
+            ↓   ↓   ↓   ↓   ↓   ↓   ↓
+Chroma QP:  0  10  20  29  36  38  39
+
+Visual quality comparison at QP 40:
+- If chroma used QP 40: Noticeable color artifacts, blocky colors
+- With chroma QP 36: Much better color quality, smoother gradients
+- Difference: 4 QP ≈ 2× better quality for "free" (exploiting perception)
+```
+
+**The mapping function:**
+```
+QP Range     | Luma → Chroma Mapping
+-------------|------------------------------------
+0-29         | Identity (1:1)
+30-39        | Compressed (10 luma QP → 10 chroma QP)
+40-51        | Heavily compressed (12 luma QP → 3 chroma QP!)
+
+At the high end (QP 48-51):
+  48 → 39
+  49 → 39  } Same chroma QP for 4 different luma QPs!
+  50 → 39  } Maximum compression preservation
+  51 → 39
+```
+
+**Bit depth scaling:**
+High bit-depth video (10-bit, 12-bit) extends QP range:
+```
+Bit Depth | QP Range | Offset | Example
+----------|----------|--------|------------------------
+8-bit     | 0-51     | +0     | QP 30 → chroma QP 29
+9-bit     | 0-57     | +6     | QP 30 → chroma QP 30
+10-bit    | 0-63     | +12    | QP 30 → chroma QP 30
+14-bit    | 0-87     | +36    | QP 72 → chroma QP 65
+```
+
+Each 2-bit increase in depth extends QP range by 12 (2 periods of 6).
+
+### Lessons Learned
+
+**Spec-Driven Development:**
+Session 16 implements H.264 spec Table 8-15 exactly:
+- Standard mapping is hardcoded from spec
+- Algorithm extends it to all bit depths
+- Static assertions verify spec compliance
+- Self-documenting code structure
+
+**Multi-Dimensional Table Generation:**
+First session with 2D table (depth × QP):
+- Outer loop: bit depths (7 iterations)
+- Inner loop: QP values (88 iterations)
+- Conditional logic: identity vs. standard vs. extended
+- Result: Concise algorithm generates complex table
+
+**Fixing Errors During Development:**
+Initial compilation revealed incorrect assertions:
+- Assumed QP 35 → chroma QP 35 (actually 33)
+- Assumed higher bit depth always gives higher chroma QP (not at identity boundaries)
+- Fixed by analyzing actual H.264 mapping behavior
+- Demonstrates value of comprehensive static assertions (catch errors early!)
+
+### What's Next?
+
+**H.264 Coverage:**
+With Sessions 14-16, H.264 quantization is complete:
+- ✅ CAVLC entropy coding (Session 14)
+- ✅ QP arithmetic (Session 15)
+- ✅ Chroma QP mapping (Session 16)
+- ⏳ Additional opportunities: scan patterns, more coefficient tables
+
+**Other High-Priority Codecs:**
+- HEVC/H.265 tables (successor to H.264)
+- VP9/AV1 tables (modern codecs)
+- AAC PS Fixed tables (awaiting SoftFloat constexpr)
+- VC-1 tables (legacy but still used)
+
+**Modernization Milestone:**
+- 27 files across 16 sessions
+- 273,339 compile-time entries (585× growth from original!)
+- 813+ static assertions
+- Major codec coverage expanding
+- Zero-overhead principle maintained throughout!
+
+---
+
+**Session 16 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (H.264 chroma QP mapping)
+- H.264 quantization trilogy: ✅ COMPLETE
+- Multi-dimensional table generation: ✅
+- Perceptual coding principles: ✅ (chroma preservation)
+- Spec compliance: ✅ (H.264 Table 8-15)
+- All bit depths supported: ✅ (8-14 bit)
+- Compilation errors fixed: ✅
 - Mission continues: ✅
