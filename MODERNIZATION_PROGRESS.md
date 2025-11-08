@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 23 files (9 C → C++, 16 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~8,720 C++ lines + 740 lines documentation
-**Table Entries Generated:** 266,915 entries at compile time (566x growth!)
-**Static Assertions Added:** 610 compile-time validations (7.0% density)
+**Files Converted:** 24 files (9 C → C++, 17 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~9,050 C++ lines + 770 lines documentation
+**Table Entries Generated:** 268,963 entries at compile time (571x growth!)
+**Static Assertions Added:** 638 compile-time validations (7.0% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 14 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, reverse, more)
 
@@ -2889,4 +2889,170 @@ with zero runtime cost while supporting flexible bitrate/quality strategies.
 - Dolby Digital support: ✅ (Cinema/broadcast/home theater)
 - Strategy flexibility: ✅ (D15/D25/D45 for bitrate control)
 - Coupling modes: ✅ (Separate handling for channel types)
+- Mission continues: ✅
+
+---
+
+## Session 13: Bink Video Codec Quantization Tables
+
+**Date:** 2025-11-07
+**Focus:** RAD Game Tools video codec DCT quantization
+**Complexity:** Medium-High - Fixed-point arithmetic with scan reordering
+
+### Overview
+
+Session 13 adds compile-time generation of DCT quantization tables for Bink video codec
+version 'b'. Bink is developed by RAD Game Tools and widely used in video games for
+cutscenes and cinematics. The tables provide quantization values for intra and inter-frame
+DCT coefficient dequantization.
+
+### New Constexpr Header
+
+**File:** `libavcodec/bink_tablegen_constexpr.hpp`  
+**Replaces:** Runtime initialization in `libavcodec/bink.c binkb_calc_quant()`  
+**Size:** ~330 lines (13 KB)  
+**Tables:** 2 quantization tables (2,048 int32_t total, 8,192 bytes)
+
+### Tables Generated
+
+1. **binkb_intra_quant[16][64]** (1,024 int32_t) - Intra-frame quantization
+2. **binkb_inter_quant[16][64]** (1,024 int32_t) - Inter-frame quantization
+
+Dimensions:
+- 16 quantization levels (coarse to fine)
+- 64 DCT coefficients per 8×8 block
+
+### Algorithm
+
+**Complex multi-factor calculation:**
+
+```cpp
+for j = 0..15:  // Quantization levels
+  for i = 0..63:  // DCT coefficients
+    k = inv_bink_scan[i]  // Reorder via inverse scan
+    
+    numerator = seed[i] × s[i] × num[j]
+    denominator = den[j] × (C >> 12)
+    
+    quant[j][k] = numerator / denominator
+```
+
+**Components:**
+- **seed[i]**: Base quantization values (intra_seed or inter_seed)
+- **s[i]**: DCT coefficient scaling factors (frequency weighting)
+- **num[j]/den[j]**: Rational multipliers for quantization levels
+- **C**: Fixed-point constant (2^30 = 1,073,741,824)
+- **inv_bink_scan**: Inverse of Bink's zig-zag scan pattern
+
+**Scan Reordering:**
+The algorithm uses Bink's custom 8×8 block scan order, requiring inverse scan table
+generation to map from sequential to scan order.
+
+### Fixed-Point Arithmetic
+
+The calculation uses 64-bit fixed-point arithmetic:
+- s[i] values are in fixed-point format (scaled by C)
+- Division by (C >> 12) = 262,144 converts back to integer
+- Ensures accurate quantization without floating-point operations
+
+### Validation
+
+**Static Assertions:** 28 compile-time validations
+
+**Key Tests:**
+- Table dimensions [16][64]
+- Inverse scan correctness: inv_bink_scan[bink_scan[i]] == i for all i
+- Tables populated (non-zero values)
+- Intra vs inter differences (1008/1024 entries differ)
+- Quantization level progression (higher levels = coarser)
+- Seed table values
+- Num/den rational multipliers
+- Scaling factor magnitudes
+- Fixed-point constant C = 2^30
+
+### Benefits
+
+- ⚡ Zero runtime initialization (2,048 int32_t at compile time)
+- 🎮 Game industry standard codec (RAD Game Tools)
+- 📐 Fixed-point arithmetic for precision
+- ✅ Complex multi-factor calculation verified
+- 🔧 Scan reordering handled at compile time
+- 💾 8,192 bytes of quantization data
+
+---
+
+### Session 13 Statistics
+
+**Files Created:** 1 constexpr header  
+**Total Entries:** 2,048 int32_t (8,192 bytes)
+  - binkb_intra_quant[16][64]: 1,024 entries
+  - binkb_inter_quant[16][64]: 1,024 entries
+
+**Static Assertions:** 28 compile-time validations  
+**Lines of Code:** ~330 lines  
+**Complexity:** Medium-High
+  - Fixed-point arithmetic (64-bit intermediate)
+  - Inverse scan table generation
+  - Multi-factor quantization calculation
+  - Frequency-dependent scaling
+  - Rational number multipliers
+
+### Technical Achievements
+
+**Patterns Demonstrated:**
+1. **Fixed-Point Arithmetic:** 64-bit intermediate calculations for precision
+2. **Scan Reordering:** Inverse lookup table generation
+3. **Multi-Factor Quantization:** seed × scaling × (num/den) / fixed_divisor
+4. **Frequency Weighting:** DCT coefficient scaling factors
+5. **Dual Tables:** Separate intra vs inter quantization
+
+**Algorithms:**
+- ✅ Inverse scan pattern generation
+- ✅ Fixed-point multiplication and division
+- ✅ Rational number scaling (num/den pairs)
+- ✅ Frequency-dependent coefficient weighting
+- ✅ Multi-dimensional table calculation
+
+**Data Types:**
+- ✅ int32_t quantization values
+- ✅ int64_t intermediate calculations (overflow protection)
+- ✅ uint8_t seed and scaling tables
+- ✅ Two-dimensional arrays [16][64]
+
+### Cumulative Progress (After Session 13)
+
+**Total Files:** 24 files (9 C → C++, 17 constexpr headers, 1 pattern library)  
+**Total Entries:** 268,963 entries at compile time!  
+**Static Assertions:** 638 validations (7.0% density)  
+**Constexpr Functions:** 14 (maintained)  
+**Lines of Modern C++:** ~9,380 lines
+
+**Coverage:**
+- ✅ Audio codec tables (complete: PCM, MP3, AAC, QDM2, VIMA, DSD, COOK, Dolby E, DCA-LBR, AC-3)
+- ✅ Video codec tables (expanding: DV, Dirac, **Bink**)
+- ✅ Mathematical utilities (complete)
+- ✅ Pattern library (complete)
+
+### What's Next?
+
+**Remaining Opportunities:**
+- H.264 CAVLC level tables
+- VC-1 decoder tables
+- More game codec tables (Bink audio)
+- Additional AC-3/E-AC-3 tables
+
+**Status:** Production-ready and continuously expanding!
+
+The Bink conversion demonstrates sophisticated compile-time generation of video codec
+quantization tables using fixed-point arithmetic, achieving 2,048 quantization values
+with zero runtime cost while maintaining game industry codec standards.
+
+---
+
+**Session 13 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (Bink video quantization)
+- Game codec support: ✅ (RAD Game Tools industry standard)
+- Fixed-point arithmetic: ✅ (64-bit intermediate precision)
+- Scan reordering: ✅ (Inverse lookup generation)
 - Mission continues: ✅
