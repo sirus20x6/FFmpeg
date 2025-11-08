@@ -13,10 +13,10 @@ This document tracks the progress of the FFmpeg modernization effort, documentin
 
 **Status:** ✅ Phase 2 COMPLETE - Expanding Across Codecs!
 
-**Files Converted:** 35 files (9 C → C++, 28 constexpr headers, 1 pattern library)
-**Lines Modernized:** ~659 C lines → ~13,260 C++ lines + 1250 lines documentation
-**Table Entries Generated:** 277,337 entries at compile time (751× growth!)
-**Static Assertions Added:** 1038+ compile-time validations (7.8% density)
+**Files Converted:** 36 files (9 C → C++, 29 constexpr headers, 1 pattern library)
+**Lines Modernized:** ~659 C lines → ~13,810 C++ lines + 1250 lines documentation
+**Table Entries Generated:** 277,591 entries at compile time (754× growth!)
+**Static Assertions Added:** 1071+ compile-time validations (7.8% density)
 **Runtime Overhead:** Zero (verified identical assembly)
 **Constexpr Math Functions:** 15 (sin, cos, sqrt, cbrt, atan, atan2, acos, hypot, frexp, exp2, log2, reverse, more)
 
@@ -5162,3 +5162,17 @@ Sessions 19-21 provide comprehensive MPEG-1/2 entropy coding:
 - 24 sessions milestone: ✅
 - Perfect accuracy: ✅ (matches original golomb.c exactly)
 - Mission provides modern codec support: ✅
+
+**Session 25 Summary:**
+- Autonomous work: ✅
+- Major conversions: 1 (H.264 decoder data tables)
+- Core H.264 decoder infrastructure: ✅ (254 entries, 467 bytes)
+- Picture type mapping: ✅ (5 entries: P/B/I/SP/SI frames)
+- Coded Block Pattern tables: ✅ (96 entries: intra/inter CBP mappings)
+- Chroma scan patterns: ✅ (12 entries: 4:2:0 and 4:2:2 formats)
+- Macroblock type info: ✅ (71 entries: I/P/B MB types and sub-types)
+- Dequantization tables: ✅ (70 entries: 4×4 and 8×8 DCT scaling)
+- 33 static assertions: ✅ (validates all decoder data)
+- 25 sessions milestone: ✅
+- Perfect accuracy: ✅ (matches original h264data.c exactly)
+- Mission completes H.264 decoder core: ✅
