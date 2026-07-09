@@ -31,9 +31,29 @@
 #include <libavutil/avutil.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/error.h>
+#include <libavutil/time.h>
 
 static volatile sig_atomic_t stop_flag = 0;
 static void on_signal(int s) { (void)s; stop_flag = 1; }
+
+/* Live pacing: when set, output is paced to real time (1x) like a TV channel,
+ * so a downstream server/muxer advances in wall-clock. t0_wall anchors
+ * timeline-0 to a wall-clock instant on the first paced packet. */
+static int live = 0;
+static int64_t t0_wall = AV_NOPTS_VALUE;
+
+/* pace_to sleeps (when --live) until the given timeline position (microseconds)
+ * is due in wall-clock. A large gap is capped so a discontinuity can't stall. */
+static void pace_to(int64_t timeline_us)
+{
+    if (!live || timeline_us == AV_NOPTS_VALUE)
+        return;
+    if (t0_wall == AV_NOPTS_VALUE)
+        t0_wall = av_gettime_relative() - timeline_us; /* first packet: due now */
+    int64_t wait = (t0_wall + timeline_us) - av_gettime_relative();
+    if (wait > 0 && wait < 5 * AV_TIME_BASE)
+        av_usleep(wait);
+}
 
 static char errbuf[AV_ERROR_MAX_STRING_SIZE];
 static const char *errstr(int err)
@@ -186,6 +206,9 @@ static int play_one(Output *o, const char *infile, int64_t *offset_us)
         pkt->pos = -1;
         pkt->stream_index = out_idx;
 
+        /* Pace to real time before emitting (live output only). */
+        pace_to(dts_us);
+
         ret = av_interleaved_write_frame(o->ctx, pkt);
         av_packet_unref(pkt);
         if (ret < 0) {
@@ -205,11 +228,17 @@ int main(int argc, char **argv)
 {
     int loop = 0;
     int argi = 1;
-    if (argi < argc && !strcmp(argv[argi], "--loop")) { loop = 1; argi++; }
+    for (; argi < argc; argi++) {
+        if (!strcmp(argv[argi], "--loop")) loop = 1;
+        else if (!strcmp(argv[argi], "--live")) live = 1;
+        else break;
+    }
     if (argc - argi < 2) {
         fprintf(stderr,
             "mpplayout — memepipe playout engine (fork of ffmpeg)\n"
-            "usage: %s [--loop] <output_url> <clip1> [clip2 ...]\n", argv[0]);
+            "usage: %s [--loop] [--live] <output_url> <clip1> [clip2 ...]\n"
+            "  --loop  repeat the clip sequence forever (slate loop)\n"
+            "  --live  pace output to real time (1x) for a live target\n", argv[0]);
         return 2;
     }
     const char *out_url = argv[argi++];
