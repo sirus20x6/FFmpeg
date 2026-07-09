@@ -56,3 +56,6 @@
 /libavfilter/vulkan/*.c
 /.*/
 !/.forgejo/
+
+# memepipe fork build artifacts
+/mpplayout
