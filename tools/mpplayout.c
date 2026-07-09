@@ -1,31 +1,42 @@
 /*
  * mpplayout — memepipe playout engine (ffplayout's role), built on libav*.
  *
- * v0: play a sequence of clips into ONE continuous, monotonic output stream.
- * Each clip is demuxed and its packets are remuxed (stream-copy) to the output
- * with pts/dts shifted by the running output duration, so independent files
- * form a single seamless timeline. Continuity is done HERE, explicitly, by
- * accumulating an offset — not delegated to a container's discontinuity
- * handling — so the output can be any format and a mid-clip splice can be
- * corrected in later versions.
+ * Plays a sequence of clips into ONE continuous, monotonic output stream.
+ * Independent clips are stitched into a single timeline by shifting each
+ * clip's pts/dts by the running output duration — continuity is done HERE,
+ * explicitly, not delegated to a container's discontinuity handling, so the
+ * output can be any format.
  *
- * Usage:
- *   mpplayout [--loop] <output_url> <clip1> [clip2 ...]
+ * Two modes:
  *
- *   --loop   repeat the clip sequence forever (slate loop).
- *   output_url  rtmp://host/app/stream  (flv), file.ts, file.flv, udp://, ...
+ *   Simple (no --control):
+ *     mpplayout [--loop] [--live] <output_url> <clip1> [clip2 ...]
+ *   Play the clips once, or forever with --loop.
  *
- * This is the foundation of the fork's playout role. Next: a control channel
- * (play a movie / seek / return to slate), splice correction, and the live
- * WHEP egress that replaces MediaMTX.
+ *   Playout engine (--control <fifo>):
+ *     mpplayout --live --control <fifo> <output_url> <slate1> [slate2 ...]
+ *   The clips become the SLATE loop (overtures/intermission). Commands written
+ *   to the control FIFO drive what's on air, live, without ever tearing down
+ *   the output:
+ *       play <path> [seek_seconds]   put a movie on air (interrupts slate)
+ *       seek <seconds>               reposition the on-air movie
+ *       slate                        return to the slate loop (no autoplay)
+ *       stop                         end
  *
- * Build (standalone against the fork's libraries):
- *   see tools/mpplayout.build.sh
+ *   --live paces the output to real time (1x), like a TV channel.
+ *
+ * This is the fork's playout role (replaces ffplayout). The live WHEP egress
+ * that replaces MediaMTX is the next module (see MEMEPIPE_FORK.md).
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
@@ -36,24 +47,81 @@
 static volatile sig_atomic_t stop_flag = 0;
 static void on_signal(int s) { (void)s; stop_flag = 1; }
 
-/* Live pacing: when set, output is paced to real time (1x) like a TV channel,
- * so a downstream server/muxer advances in wall-clock. t0_wall anchors
- * timeline-0 to a wall-clock instant on the first paced packet. */
+/* ---- live pacing ------------------------------------------------------- */
+
 static int live = 0;
 static int64_t t0_wall = AV_NOPTS_VALUE;
 
-/* pace_to sleeps (when --live) until the given timeline position (microseconds)
- * is due in wall-clock. A large gap is capped so a discontinuity can't stall. */
 static void pace_to(int64_t timeline_us)
 {
     if (!live || timeline_us == AV_NOPTS_VALUE)
         return;
     if (t0_wall == AV_NOPTS_VALUE)
-        t0_wall = av_gettime_relative() - timeline_us; /* first packet: due now */
+        t0_wall = av_gettime_relative() - timeline_us;
     int64_t wait = (t0_wall + timeline_us) - av_gettime_relative();
     if (wait > 0 && wait < 5 * AV_TIME_BASE)
         av_usleep(wait);
 }
+
+/* ---- control channel --------------------------------------------------- */
+
+static pthread_mutex_t ctl_mu = PTHREAD_MUTEX_INITIALIZER;
+static char   ctl_movie[4096] = "";  /* on-air movie path; "" = slate */
+static double ctl_seek = 0;           /* movie seek point, seconds */
+static volatile int ctl_gen = 0;      /* bumps on every command; the play loop
+                                       * interrupts the current clip when it sees
+                                       * a newer gen than it started with */
+static volatile int ctl_stop = 0;
+
+/* ctl_reader consumes newline commands from the control FIFO. It holds the FIFO
+ * open O_RDWR so it never EOFs as writers come and go. */
+static void *ctl_reader(void *arg)
+{
+    const char *path = arg;
+    mkfifo(path, 0666); /* ignore EEXIST */
+    int fd = open(path, O_RDWR);
+    if (fd < 0) { perror("mpplayout: open control fifo"); return NULL; }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return NULL; }
+
+    char line[4096];
+    while (!stop_flag && fgets(line, sizeof line, f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        char cmd[64] = "", a1[4096] = "";
+        double a2 = 0;
+        int n = sscanf(line, "%63s %4095s %lf", cmd, a1, &a2);
+        if (n < 1) continue;
+
+        pthread_mutex_lock(&ctl_mu);
+        if (!strcmp(cmd, "play") && n >= 2) {
+            snprintf(ctl_movie, sizeof ctl_movie, "%s", a1);
+            ctl_seek = (n >= 3) ? a2 : 0;
+            ctl_gen++;
+            fprintf(stderr, "mpplayout: [ctl] play %s @%.0f\n", a1, ctl_seek);
+        } else if (!strcmp(cmd, "seek") && n >= 2) {
+            ctl_seek = atof(a1);
+            ctl_gen++;
+            fprintf(stderr, "mpplayout: [ctl] seek %.0f\n", ctl_seek);
+        } else if (!strcmp(cmd, "slate")) {
+            ctl_movie[0] = '\0';
+            ctl_gen++;
+            fprintf(stderr, "mpplayout: [ctl] slate\n");
+        } else if (!strcmp(cmd, "stop")) {
+            ctl_stop = 1;
+            stop_flag = 1;
+            ctl_gen++;
+            fprintf(stderr, "mpplayout: [ctl] stop\n");
+        } else {
+            fprintf(stderr, "mpplayout: [ctl] ignored: %s\n", line);
+        }
+        pthread_mutex_unlock(&ctl_mu);
+    }
+    fclose(f);
+    return NULL;
+}
+
+/* ---- muxing ------------------------------------------------------------ */
 
 static char errbuf[AV_ERROR_MAX_STRING_SIZE];
 static const char *errstr(int err)
@@ -62,16 +130,13 @@ static const char *errstr(int err)
     return errbuf;
 }
 
-/* The output layout, established from the first clip and reused for all. */
 typedef struct Output {
     AVFormatContext *ctx;
-    int video_idx;   /* output stream index for video, or -1 */
-    int audio_idx;   /* output stream index for audio, or -1 */
+    int video_idx;
+    int audio_idx;
     int header_written;
 } Output;
 
-/* first_stream_of_type returns the index of the first stream of `type` in ic,
- * or -1. */
 static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
 {
     for (unsigned i = 0; i < ic->nb_streams; i++)
@@ -80,10 +145,6 @@ static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
     return -1;
 }
 
-/* open_output allocates the muxer from the first clip's streams and opens the
- * IO. Video and audio are stream-copied, so the output codecpar mirrors the
- * source; every subsequent clip must be codec-compatible (our staged clips are
- * uniform H.264 + AAC). */
 static int open_output(Output *o, const char *url, AVFormatContext *first)
 {
     const char *fmt = NULL;
@@ -103,16 +164,16 @@ static int open_output(Output *o, const char *url, AVFormatContext *first)
     if (vin >= 0) {
         AVStream *os = avformat_new_stream(o->ctx, NULL);
         if (!os) return AVERROR(ENOMEM);
-        ret = avcodec_parameters_copy(os->codecpar, first->streams[vin]->codecpar);
-        if (ret < 0) return ret;
+        if ((ret = avcodec_parameters_copy(os->codecpar, first->streams[vin]->codecpar)) < 0)
+            return ret;
         os->codecpar->codec_tag = 0;
         o->video_idx = os->index;
     }
     if (ain >= 0) {
         AVStream *os = avformat_new_stream(o->ctx, NULL);
         if (!os) return AVERROR(ENOMEM);
-        ret = avcodec_parameters_copy(os->codecpar, first->streams[ain]->codecpar);
-        if (ret < 0) return ret;
+        if ((ret = avcodec_parameters_copy(os->codecpar, first->streams[ain]->codecpar)) < 0)
+            return ret;
         os->codecpar->codec_tag = 0;
         o->audio_idx = os->index;
     }
@@ -124,8 +185,7 @@ static int open_output(Output *o, const char *url, AVFormatContext *first)
             return ret;
         }
     }
-    ret = avformat_write_header(o->ctx, NULL);
-    if (ret < 0) {
+    if ((ret = avformat_write_header(o->ctx, NULL)) < 0) {
         fprintf(stderr, "mpplayout: write_header: %s\n", errstr(ret));
         return ret;
     }
@@ -133,46 +193,52 @@ static int open_output(Output *o, const char *url, AVFormatContext *first)
     return 0;
 }
 
-/* play_one remuxes a single clip into the output, shifting timestamps so it
- * starts at *offset_us (microseconds, AV_TIME_BASE_Q). On return *offset_us is
- * advanced to the end of this clip, so the next clip continues the timeline.
- * Streams are mapped by first-video / first-audio to the fixed output layout. */
-static int play_one(Output *o, const char *infile, int64_t *offset_us)
+enum { SRC_EOF = 0, SRC_INTERRUPTED = 1, SRC_ERROR = -1 };
+
+/* play_source remuxes one clip into the output starting at *offset_us on the
+ * timeline. seek_s>0 fast-seeks into the clip first (the output timeline still
+ * continues from the offset — only the CONTENT position changes). It aborts
+ * early (SRC_INTERRUPTED) the moment a newer control gen appears, so a live
+ * command switches source without waiting for the clip to end. */
+static int play_source(Output *o, const char *infile, double seek_s,
+                       int64_t *offset_us, int my_gen)
 {
     AVFormatContext *ic = NULL;
     int ret = avformat_open_input(&ic, infile, NULL, NULL);
     if (ret < 0) {
         fprintf(stderr, "mpplayout: open %s: %s\n", infile, errstr(ret));
-        return ret;
+        return SRC_ERROR;
     }
-    ret = avformat_find_stream_info(ic, NULL);
-    if (ret < 0) {
+    if ((ret = avformat_find_stream_info(ic, NULL)) < 0) {
         fprintf(stderr, "mpplayout: stream info %s: %s\n", infile, errstr(ret));
         avformat_close_input(&ic);
-        return ret;
+        return SRC_ERROR;
+    }
+    if (seek_s > 0) {
+        int64_t ts = (int64_t)(seek_s * AV_TIME_BASE);
+        if (avformat_seek_file(ic, -1, INT64_MIN, ts, ts, 0) < 0)
+            fprintf(stderr, "mpplayout: seek %s to %.1fs failed (playing from start)\n",
+                    infile, seek_s);
     }
 
     int vin = first_stream_of_type(ic, AVMEDIA_TYPE_VIDEO);
     int ain = first_stream_of_type(ic, AVMEDIA_TYPE_AUDIO);
 
-    const int64_t base = *offset_us;   /* where this clip begins on the timeline */
-    int64_t clip_start = AV_NOPTS_VALUE; /* first dts of the clip, in us */
-    int64_t clip_end = base;           /* running max end, in us */
+    const int64_t base = *offset_us;
+    int64_t clip_start = AV_NOPTS_VALUE;
+    int64_t clip_end = base;
+    int rc = SRC_EOF;
 
     AVPacket *pkt = av_packet_alloc();
-    if (!pkt) { avformat_close_input(&ic); return AVERROR(ENOMEM); }
+    if (!pkt) { avformat_close_input(&ic); return SRC_ERROR; }
 
     while (!stop_flag) {
-        ret = av_read_frame(ic, pkt);
-        if (ret < 0) {                 /* EOF or error → clip done */
-            if (ret != AVERROR_EOF)
-                fprintf(stderr, "mpplayout: read %s: %s\n", infile, errstr(ret));
-            ret = 0;
-            break;
-        }
+        if (ctl_gen != my_gen) { rc = SRC_INTERRUPTED; break; }
 
-        int in_idx = pkt->stream_index;
-        int out_idx = -1;
+        ret = av_read_frame(ic, pkt);
+        if (ret < 0) { rc = SRC_EOF; break; }
+
+        int in_idx = pkt->stream_index, out_idx = -1;
         if (in_idx == vin) out_idx = o->video_idx;
         else if (in_idx == ain) out_idx = o->audio_idx;
         if (out_idx < 0) { av_packet_unref(pkt); continue; }
@@ -180,8 +246,6 @@ static int play_one(Output *o, const char *infile, int64_t *offset_us)
         AVRational in_tb  = ic->streams[in_idx]->time_base;
         AVRational out_tb = o->ctx->streams[out_idx]->time_base;
 
-        /* Rescale to microseconds, rebase to the clip start, add the timeline
-         * offset — so the whole clip lands at [base, base+duration). */
         int64_t pts_us = (pkt->pts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE
                          : av_rescale_q(pkt->pts, in_tb, AV_TIME_BASE_Q);
         int64_t dts_us = (pkt->dts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE
@@ -194,7 +258,6 @@ static int play_one(Output *o, const char *infile, int64_t *offset_us)
 
         if (pts_us != AV_NOPTS_VALUE) pts_us = pts_us - clip_start + base;
         if (dts_us != AV_NOPTS_VALUE) dts_us = dts_us - clip_start + base;
-
         if (dts_us != AV_NOPTS_VALUE && dts_us + dur_us > clip_end)
             clip_end = dts_us + dur_us;
 
@@ -206,13 +269,13 @@ static int play_one(Output *o, const char *infile, int64_t *offset_us)
         pkt->pos = -1;
         pkt->stream_index = out_idx;
 
-        /* Pace to real time before emitting (live output only). */
         pace_to(dts_us);
 
         ret = av_interleaved_write_frame(o->ctx, pkt);
         av_packet_unref(pkt);
         if (ret < 0) {
             fprintf(stderr, "mpplayout: write frame: %s\n", errstr(ret));
+            rc = SRC_ERROR;
             break;
         }
     }
@@ -221,24 +284,75 @@ static int play_one(Output *o, const char *infile, int64_t *offset_us)
     avformat_close_input(&ic);
     if (clip_end > *offset_us)
         *offset_us = clip_end;
+    return rc;
+}
+
+/* run_engine is the control-driven loop: loop the slate, switch to a movie on
+ * command, back to slate on movie EOF (no autoplay). One continuous timeline. */
+static int run_engine(Output *o, char **slate, int nslate)
+{
+    int64_t offset_us = 0;
+    int slate_idx = 0;
+    int ret = 0;
+
+    while (!stop_flag && !ctl_stop) {
+        pthread_mutex_lock(&ctl_mu);
+        int gen = ctl_gen;
+        char movie[4096];
+        snprintf(movie, sizeof movie, "%s", ctl_movie);
+        double seek = ctl_seek;
+        pthread_mutex_unlock(&ctl_mu);
+
+        const char *src = movie[0] ? movie : slate[slate_idx];
+        double src_seek = movie[0] ? seek : 0;
+
+        int r = play_source(o, src, src_seek, &offset_us, gen);
+        if (r == SRC_ERROR) {
+            /* A bad source shouldn't kill the channel: if it was the movie,
+             * fall back to slate; if slate itself is bad, advance past it. */
+            if (movie[0]) { pthread_mutex_lock(&ctl_mu);
+                if (ctl_gen == gen) { ctl_movie[0] = '\0'; ctl_gen++; }
+                pthread_mutex_unlock(&ctl_mu); }
+            else slate_idx = (slate_idx + 1) % nslate;
+            continue;
+        }
+        if (r == SRC_INTERRUPTED)
+            continue; /* a command arrived; re-read the program */
+
+        /* natural EOF */
+        if (movie[0]) {
+            /* movie finished → back to slate, do NOT auto-advance a queue */
+            pthread_mutex_lock(&ctl_mu);
+            if (ctl_gen == gen) { ctl_movie[0] = '\0'; ctl_gen++; }
+            pthread_mutex_unlock(&ctl_mu);
+            fprintf(stderr, "mpplayout: movie ended → slate\n");
+        } else {
+            slate_idx = (slate_idx + 1) % nslate;
+        }
+    }
     return ret;
 }
 
 int main(int argc, char **argv)
 {
     int loop = 0;
+    const char *control = NULL;
     int argi = 1;
     for (; argi < argc; argi++) {
         if (!strcmp(argv[argi], "--loop")) loop = 1;
         else if (!strcmp(argv[argi], "--live")) live = 1;
+        else if (!strcmp(argv[argi], "--control") && argi + 1 < argc) control = argv[++argi];
         else break;
     }
     if (argc - argi < 2) {
         fprintf(stderr,
             "mpplayout — memepipe playout engine (fork of ffmpeg)\n"
-            "usage: %s [--loop] [--live] <output_url> <clip1> [clip2 ...]\n"
-            "  --loop  repeat the clip sequence forever (slate loop)\n"
-            "  --live  pace output to real time (1x) for a live target\n", argv[0]);
+            "usage: %s [--loop] [--live] [--control <fifo>] <output_url> <clip1> [clip2 ...]\n"
+            "  --loop           repeat the clips forever (simple mode)\n"
+            "  --live           pace output to real time (1x)\n"
+            "  --control <fifo> playout-engine mode: clips = slate loop; FIFO commands\n"
+            "                   drive it (play <path> [seek] | seek <s> | slate | stop)\n",
+            argv[0]);
         return 2;
     }
     const char *out_url = argv[argi++];
@@ -249,7 +363,6 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     avformat_network_init();
 
-    /* Open the first clip to establish the output stream layout. */
     AVFormatContext *first = NULL;
     int ret = avformat_open_input(&first, clips[0], NULL, NULL);
     if (ret < 0) {
@@ -267,16 +380,23 @@ int main(int argc, char **argv)
     avformat_close_input(&first);
     if (ret < 0) goto done;
 
-    fprintf(stderr, "mpplayout: on air → %s (%d clip(s)%s)\n",
-            out_url, nclips, loop ? ", looping" : "");
-
-    int64_t offset_us = 0;
-    do {
-        for (int i = 0; i < nclips && !stop_flag; i++) {
-            ret = play_one(&o, clips[i], &offset_us);
-            if (ret < 0) { stop_flag = 1; break; }
-        }
-    } while (loop && !stop_flag);
+    pthread_t ctl_thread = 0;
+    if (control) {
+        fprintf(stderr, "mpplayout: engine mode → %s (slate=%d clip(s), control=%s%s)\n",
+                out_url, nclips, control, live ? ", live" : "");
+        pthread_create(&ctl_thread, NULL, ctl_reader, (void *)control);
+        ret = run_engine(&o, clips, nclips);
+    } else {
+        fprintf(stderr, "mpplayout: on air → %s (%d clip(s)%s%s)\n",
+                out_url, nclips, loop ? ", looping" : "", live ? ", live" : "");
+        int64_t offset_us = 0;
+        do {
+            for (int i = 0; i < nclips && !stop_flag; i++) {
+                int r = play_source(&o, clips[i], 0, &offset_us, ctl_gen);
+                if (r == SRC_ERROR) { ret = 1; stop_flag = 1; break; }
+            }
+        } while (loop && !stop_flag);
+    }
 
 done:
     if (o.ctx) {
