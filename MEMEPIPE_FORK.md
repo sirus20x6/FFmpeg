@@ -17,6 +17,7 @@ Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-ope
 |---|---|
 | Baseline fork configure + build | **done** — `ffmpeg` builds, all libs, 48-core |
 | **mpplayout** (ffplayout's role) | **done + tested** — see below |
+| **playout demuxer** (mpplayout, in-tree) | **done + tested** — `-f playout`, the true integration |
 | **whep muxer** (MediaMTX's role) | **reversal implemented + compiles**; needs browser testing (see below) |
 
 ### mpplayout — the playout engine (ffplayout's role)  ✅
@@ -121,7 +122,33 @@ muxer from ffmpeg/mpplayout: `... -c:v libx264 -c:a libopus -f whep http://host:
 Key source refs: `libavformat/whip.c`, `tls_openssl.c`, `srtp.c`, `http.c`,
 `rtpenc.c`, `tee.c`, `configure`.
 
+### playout demuxer — the engine INSIDE ffmpeg  ✅
+
+`libavformat/playoutdec.c` — mpplayout ported to a native libavformat demuxer
+(pull model), so the ENTIRE chain is one ffmpeg process:
+
+```
+ffmpeg -re -f playout -control /tmp/ctl.fifo -i "slate1.mp4|slate2.mp4" \
+       -c:v copy -c:a libopus -f whep http://0.0.0.0:8000/
+```
+
+- Input url = |-separated slate clips, looped (`-loop N` bounds it, for tests).
+- `-control <fifo>`: live commands `play <path> [seek]` / `seek <s>` / `slate` /
+  `stop`; polled non-blockingly from read_packet (no threads, no locks —
+  command latency ≤ one packet duration under -re).
+- Continuity: same explicit per-clip rebase onto a running µs timeline;
+  movie EOF → slate with NO autoplay; bad sources degrade (movie→slate,
+  slate clip skipped), never kill the channel.
+- Pacing: ffmpeg's own `-re` (the pull model makes the engine clock-free).
+- Verified: loop-once == mpplayout's output (8.1s, 0 resets, 0 decode errors);
+  live FIFO run slate→play@5→slate→stop under -re took exactly 10.0s wall,
+  every transition logged, output seamless (0 resets, 0 decode errors).
+
+mpplayout (tools/) remains as the standalone twin; the demuxer is the
+integrated path.
+
 ## Layout
+- `libavformat/playoutdec.c` — playout demuxer (the in-tree engine).
 - `tools/mpplayout.c` + `tools/mpplayout.build.sh` — playout engine.
 - `libavformat/whep.c` — WHEP egress muxer (scaffold).
 - This doc — architecture, status, WHEP roadmap.
