@@ -29,7 +29,8 @@
 <h2>WHEP test — memepipe ffmpeg fork</h2>
 <video id="v" autoplay playsinline controls muted></video>
 <p>
-  <input id="url" value="http://localhost:8000/">
+  <input id="url">
+  <script>document.getElementById('url').value = 'http://' + location.hostname + ':7891/';</script>
   <button onclick="play()">Play</button>
   <button onclick="stop()">Stop</button>
   <span id="status">idle</span>

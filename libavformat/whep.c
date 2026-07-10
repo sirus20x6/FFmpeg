@@ -832,6 +832,16 @@ static int generate_sdp_answer(AVFormatContext *s)
             "a=ssrc:%u msid:FFmpeg video\r\n",
             whip->video_ssrc,
             whip->video_ssrc);
+
+        /* Every ssrc referenced in ssrc-group:FID must also be DECLARED with
+         * its own a=ssrc: lines — Chrome rejects the answer otherwise
+         * ("Failed to add remote stream ssrc ... to {mid: 0}"). */
+        if (have_rtx)
+            av_bprintf(&bp, ""
+                "a=ssrc:%u cname:FFmpeg\r\n"
+                "a=ssrc:%u msid:FFmpeg video\r\n",
+                whip->video_rtx_ssrc,
+                whip->video_rtx_ssrc);
     }
     } /* end offer-ordered m-line emission */
 
