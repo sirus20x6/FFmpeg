@@ -17,8 +17,12 @@ set -e
 FORK="$(cd "$(dirname "$0")/.." && pwd)"
 FF="$FORK/ffmpeg"
 SRC="$1"
-PORT_WHEP="${PORT_WHEP:-8000}"
-PORT_WEB="${PORT_WEB:-8080}"
+PORT_WHEP="${PORT_WHEP:-7891}"
+PORT_WEB="${PORT_WEB:-7890}"
+# Browsers reject loopback ICE candidates — advertise a real interface IP.
+ADVERTISE_IP="${ADVERTISE_IP:-$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')}"
+ADVERTISE_IP="${ADVERTISE_IP:-127.0.0.1}"
+echo "advertising ICE candidate IP: $ADVERTISE_IP"
 
 # Serve the test page (best-effort; needs python3).
 if command -v python3 >/dev/null; then
@@ -37,4 +41,4 @@ echo "whep endpoint: http://0.0.0.0:$PORT_WHEP/"
 exec "$FF" -hide_banner $IN \
     -c:v libx264 -preset veryfast -tune zerolatency -g 60 -pix_fmt yuv420p \
     -c:a libopus -ar 48000 -ac 2 \
-    -f whep "http://0.0.0.0:$PORT_WHEP/"
+    -f whep -advertise_ip "$ADVERTISE_IP" "http://0.0.0.0:$PORT_WHEP/"

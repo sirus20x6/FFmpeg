@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WHEP headless probe</title>
+<video id="v" autoplay playsinline muted></video>
+<script>
+// Auto-run WHEP client for headless testing. Reports every state transition
+// to the serving origin's /log endpoint so the harness can read the timeline.
+const WHEP = new URLSearchParams(location.search).get('whep') || 'http://127.0.0.1:7891/';
+function log(msg) {
+  fetch('/log', { method: 'POST', body: msg }).catch(() => {});
+}
+window.onerror = (m) => log('pageerror: ' + m);
+
+(async () => {
+  log('start whep=' + WHEP);
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  pc.ontrack = e => { log('ontrack: ' + e.track.kind); document.getElementById('v').srcObject = e.streams[0]; };
+  pc.oniceconnectionstatechange = () => log('ice: ' + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => log('conn: ' + pc.connectionState);
+  pc.onicegatheringstatechange = () => log('gathering: ' + pc.iceGatheringState);
+  pc.onicecandidate = e => log('localcand: ' + (e.candidate ? e.candidate.candidate : '<null>'));
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const done = () => { if (pc.iceGatheringState === 'complete') res(); };
+    pc.addEventListener('icegatheringstatechange', done);
+    setTimeout(res, 1500);
+  });
+  log('offer-sdp:\n' + pc.localDescription.sdp);
+
+  try {
+    const resp = await fetch(WHEP, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    log('http: ' + resp.status);
+    if (!resp.ok) return;
+    const answer = await resp.text();
+    log('answer-sdp:\n' + answer);
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+    log('answer-set');
+  } catch (e) {
+    log('error: ' + e.message);
+  }
+
+  // periodic stats so we can see if media actually flows
+  setInterval(async () => {
+    if (!pc) return;
+    let lines = [];
+    const stats = await pc.getStats();
+    stats.forEach(s => {
+      if (s.type === 'inbound-rtp')
+        lines.push(`inbound ${s.kind}: packets=${s.packetsReceived} bytes=${s.bytesReceived}`);
+      if (s.type === 'candidate-pair' && s.state)
+        lines.push(`pair ${s.state}: reqSent=${s.requestsSent} respRecv=${s.responsesReceived} sent=${s.packetsSent||0}`);
+    });
+    if (lines.length) log('stats: ' + lines.join(' | '));
+  }, 2000);
+})();
+</script>

@@ -18,7 +18,7 @@ Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-lib
 | Baseline fork configure + build | **done** — `ffmpeg` builds, all libs, 48-core |
 | **mpplayout** (ffplayout's role) | **done + tested** — see below |
 | **playout demuxer** (mpplayout, in-tree) | **done + tested** — `-f playout`, the true integration |
-| **whep muxer** (MediaMTX's role) | **reversal implemented + compiles**; needs browser testing (see below) |
+| **whep muxer** (MediaMTX's role) | **done + browser-verified** — full ladder works vs real Firefox (see below) |
 
 ### mpplayout — the playout engine (ffplayout's role)  ✅
 
@@ -43,7 +43,36 @@ clip and re-offset), subtitle-sync SEI insertion (h264_metadata BSF on the copy
 path, mirroring the current caption calibration), and feeding the whep muxer
 directly instead of RTMP-to-MediaMTX.
 
-### whep muxer — WebRTC egress (MediaMTX's role)  🚧
+### whep muxer — WebRTC egress (MediaMTX's role)  ✅
+
+**Browser-verified 2026-07-09** (headless Firefox + OpenH264, `tools/whep-auto`
+harness): HTTP+SDP → ICE (controlled) → DTLS *server* accept (52ms) → SRTP →
+RTP; 6.3K video + 1.7K audio packets received by a real `RTCPeerConnection`
+over 30s, consent keepalives answered. Hard-won lessons, in the order they bit:
+
+1. **CORS**: cross-origin `application/sdp` POST triggers an OPTIONS preflight —
+   answer 204 + CORS headers or the page sticks at "connecting".
+2. **JSEP m-line order**: the answer's m-lines must mirror the offer's order
+   AND `a=mid` values (2-pass ordered emission in generate_sdp_answer).
+3. **XOR-MAPPED-ADDRESS** is required in STUN binding responses or the browser
+   never validates the pair.
+4. **Answers must not invent payload types** (JSEP): rtx is emitted only when
+   offered; no H264/Opus in the offer = clean failure at init, not a PT-0
+   answer ("Answer had no codecs in common").
+5. **Browsers REFUSE loopback ICE candidates** — `advertise_ip 127.0.0.1`
+   means the viewer never sends one packet and ICE fails at ~5s
+   (Firefox `media.peerconnection.ice.loopback=false`; Chrome similar). This
+   was the "connecting… nothing happens" root cause. whep now warns; the demo
+   auto-detects a routable IP.
+6. whep is **one-shot**: a failed/finished session exits the process (retry =
+   "Failed to fetch"). Multi-session/SFU is the fix (next).
+
+Diagnostics that made this debuggable: per-packet rx logging in the handshake
+loop (size, peer, STUN/DTLS/RTP classification) and a headless-Firefox harness
+(`tools/`-adjacent, see scratchpad) that reports every ICE/DTLS state + SDP to
+a log server — no human in the loop.
+
+#### Original reversal roadmap (all landed)
 
 `libavformat/whep.c` (fork of `whip.c`), registered in `allformats.c`,
 `Makefile` (`CONFIG_WHEP_MUXER`), `configure` (`whep_muxer_select`). **The full

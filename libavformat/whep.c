@@ -301,6 +301,14 @@ typedef struct WHIPContext {
     int64_t whip_ice_time;
     int64_t whip_dtls_time;
     int64_t whip_srtp_time;
+
+    /* WHEP: the offer's m-line ORDER and a=mid VALUES, which the answer must
+     * mirror exactly (JSEP) — a browser rejects an answer whose m-lines are
+     * reordered or whose mids don't match its offer (observed live:
+     * "The order of m-lines in answer doesn't match order in offer"). */
+    int  video_mline_first;
+    char audio_mid[64];
+    char video_mid[64];
     int64_t whip_last_consent_tx_time;
     int64_t whip_last_consent_rx_time;
 
@@ -648,8 +656,7 @@ static int generate_sdp_answer(AVFormatContext *s)
     const char *acodec_name = NULL, *vcodec_name = NULL;
     const char *cand_ip;
     unsigned cand_prio = STUN_HOST_CANDIDATE_PRIORITY;
-    char bundle[4];
-    int bundle_index = 0;
+    char bundle[136];
     AVBPrint bp;
     WHIPContext *whip = s->priv_data;
 
@@ -663,6 +670,15 @@ static int generate_sdp_answer(AVFormatContext *s)
     }
 
     cand_ip = whip->advertise_ip ? whip->advertise_ip : "127.0.0.1";
+    /* Browsers REFUSE loopback remote ICE candidates (Firefox:
+     * media.peerconnection.ice.loopback=false by default; Chrome similar), so
+     * advertising 127.0.0.1 means the viewer never sends a single STUN packet
+     * and the session times out at "connecting". Verified live 2026-07-09. */
+    if (!strncmp(cand_ip, "127.", 4))
+        av_log(whip, AV_LOG_WARNING,
+               "WHEP advertising loopback candidate %s — browsers reject loopback "
+               "ICE candidates; set -advertise_ip to a viewer-reachable address\n",
+               cand_ip);
 
     /* Our (local) ICE credentials and SSRCs. */
     snprintf(whip->ice_ufrag_local, sizeof(whip->ice_ufrag_local), "%08x",
@@ -679,15 +695,20 @@ static int generate_sdp_answer(AVFormatContext *s)
      * whip->{audio,video,video_rtx}_payload_type from the browser's offer so the
      * answer echoes the exact PT numbers the viewer negotiated. */
 
-    if (whip->audio_par) {
-        bundle[bundle_index++] = '0';
-        bundle[bundle_index++] = ' ';
-    }
-    if (whip->video_par) {
-        bundle[bundle_index++] = '1';
-        bundle[bundle_index++] = ' ';
-    }
-    bundle[bundle_index - 1] = '\0';
+    /* Mirror the offer's a=mid values (JSEP); fall back to 0/1 when the offer
+     * carried none. The BUNDLE group must list them in the offer's m-line
+     * order, same as the m-line emission below. */
+    if (!whip->audio_mid[0])
+        av_strlcpy(whip->audio_mid, "0", sizeof(whip->audio_mid));
+    if (!whip->video_mid[0])
+        av_strlcpy(whip->video_mid, "1", sizeof(whip->video_mid));
+    if (whip->audio_par && whip->video_par)
+        snprintf(bundle, sizeof(bundle), "%s %s",
+                 whip->video_mline_first ? whip->video_mid : whip->audio_mid,
+                 whip->video_mline_first ? whip->audio_mid : whip->video_mid);
+    else
+        snprintf(bundle, sizeof(bundle), "%s",
+                 whip->video_par ? whip->video_mid : whip->audio_mid);
 
     /* a=ice-lite at session level: we are the lite/controlled agent. */
     av_bprintf(&bp, ""
@@ -703,7 +724,12 @@ static int generate_sdp_answer(AVFormatContext *s)
         WHIP_SDP_CREATOR_IP,
         bundle);
 
-    if (whip->audio_par) {
+    /* Emit the m-line sections in the OFFER's order (JSEP: an answer with
+     * reordered m-lines is rejected by the browser outright). */
+    for (int pass = 0; pass < 2; pass++) {
+    int emit_video = whip->video_mline_first ? pass == 0 : pass == 1;
+
+    if (!emit_video && whip->audio_par) {
         if (whip->audio_par->codec_id == AV_CODEC_ID_OPUS)
             acodec_name = "opus";
 
@@ -714,7 +740,7 @@ static int generate_sdp_answer(AVFormatContext *s)
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
             "a=setup:passive\r\n"
-            "a=mid:0\r\n"
+            "a=mid:%s\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg audio\r\n"
             "a=rtcp-mux\r\n"
@@ -727,6 +753,7 @@ static int generate_sdp_answer(AVFormatContext *s)
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
             whip->dtls_fingerprint,
+            whip->audio_mid,
             whip->audio_payload_type,
             acodec_name,
             whip->audio_par->sample_rate,
@@ -736,7 +763,7 @@ static int generate_sdp_answer(AVFormatContext *s)
             whip->audio_ssrc);
     }
 
-    if (whip->video_par) {
+    if (emit_video && whip->video_par) {
         level = whip->video_par->level;
         if (whip->video_par->codec_id == AV_CODEC_ID_H264) {
             vcodec_name = "H264";
@@ -745,49 +772,68 @@ static int generate_sdp_answer(AVFormatContext *s)
             profile_idc = whip->video_par->profile & 0x00ff;
         }
 
+        /* RTX only if the offer actually contained an rtx payload type: an
+         * answer must never introduce PTs absent from the offer (JSEP), and
+         * an unset rtx PT would serialize as the reserved static PT 0 (PCMU). */
+        int have_rtx = whip->video_rtx_payload_type > 0;
+
+        if (have_rtx)
+            av_bprintf(&bp, "m=video 9 UDP/TLS/RTP/SAVPF %u %u\r\n",
+                whip->video_payload_type, whip->video_rtx_payload_type);
+        else
+            av_bprintf(&bp, "m=video 9 UDP/TLS/RTP/SAVPF %u\r\n",
+                whip->video_payload_type);
+
         av_bprintf(&bp, ""
-            "m=video 9 UDP/TLS/RTP/SAVPF %u %u\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
             "a=setup:passive\r\n"
-            "a=mid:1\r\n"
+            "a=mid:%s\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg video\r\n"
             "a=rtcp-mux\r\n"
             "a=rtcp-rsize\r\n"
             "a=rtpmap:%u %s/90000\r\n"
             "a=fmtp:%u level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%02x%02x%02x\r\n"
-            "a=rtcp-fb:%u nack\r\n"
-            "a=rtpmap:%u rtx/90000\r\n"
-            "a=fmtp:%u apt=%u\r\n"
-            "a=candidate:1 1 udp %u %s %d typ host\r\n"
-            "a=end-of-candidates\r\n"
-            "a=ssrc-group:FID %u %u\r\n"
-            "a=ssrc:%u cname:FFmpeg\r\n"
-            "a=ssrc:%u msid:FFmpeg video\r\n",
-            whip->video_payload_type,
-            whip->video_rtx_payload_type,
+            "a=rtcp-fb:%u nack\r\n",
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
             whip->dtls_fingerprint,
+            whip->video_mid,
             whip->video_payload_type,
             vcodec_name,
             whip->video_payload_type,
             profile_idc,
             profile_iop,
             level,
-            whip->video_payload_type,
-            whip->video_rtx_payload_type,
-            whip->video_rtx_payload_type,
-            whip->video_payload_type,
-            cand_prio, cand_ip, whip->local_udp_port,
-            whip->video_ssrc,
-            whip->video_rtx_ssrc,
+            whip->video_payload_type);
+
+        if (have_rtx)
+            av_bprintf(&bp, ""
+                "a=rtpmap:%u rtx/90000\r\n"
+                "a=fmtp:%u apt=%u\r\n",
+                whip->video_rtx_payload_type,
+                whip->video_rtx_payload_type,
+                whip->video_payload_type);
+
+        av_bprintf(&bp, ""
+            "a=candidate:1 1 udp %u %s %d typ host\r\n"
+            "a=end-of-candidates\r\n",
+            cand_prio, cand_ip, whip->local_udp_port);
+
+        if (have_rtx)
+            av_bprintf(&bp, "a=ssrc-group:FID %u %u\r\n",
+                whip->video_ssrc, whip->video_rtx_ssrc);
+
+        av_bprintf(&bp, ""
+            "a=ssrc:%u cname:FFmpeg\r\n"
+            "a=ssrc:%u msid:FFmpeg video\r\n",
             whip->video_ssrc,
             whip->video_ssrc);
     }
+    } /* end offer-ordered m-line emission */
 
     if (!av_bprint_is_complete(&bp)) {
         av_log(whip, AV_LOG_ERROR, "Answer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
@@ -836,6 +882,7 @@ static int whep_serve_offer(AVFormatContext *s)
     /* Request buffer: headers + SDP body. */
     char reqbuf[MAX_SDP_SIZE * 2];
     int total = 0, hdr_end = -1, content_length = -1, body_start = 0, body_len;
+    int req_end, leftover = 0;
     const char *proto_name = avio_find_protocol_name(s->url);
 
     if (!proto_name || !av_strstart(proto_name, "http", NULL)) {
@@ -865,53 +912,122 @@ static int whep_serve_offer(AVFormatContext *s)
 
     av_log(whip, AV_LOG_INFO, "WHEP listening on %s, waiting for a viewer offer...\n", tcp_url);
 
-    /* Accept exactly one viewer connection (single-viewer target). */
-    ret = ffurl_accept(whip->whep_listener, &whip->whep_conn);
-    if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "WHEP failed to accept viewer connection\n");
-        return ret;
-    }
+    /* Serve HTTP requests until a POST delivers the SDP offer. This CANNOT be
+     * a single accept+read: the watch-party page lives on a different origin
+     * than this endpoint, so before the WHEP POST the browser sends a CORS
+     * preflight OPTIONS (application/sdp is not a "simple" content type).
+     * Failing to answer it deadlocked both sides — the server waiting for an
+     * SDP body that never comes, the browser waiting for preflight headers.
+     * So: answer preflights (and reject strays), on the same keep-alive
+     * connection or a fresh one, until the real offer arrives.
+     * TODO(whep): still no chunked request bodies, no path routing, and no
+     * enforcement of whip->authorization (Bearer) on the request. */
+    for (;;) {
+        char method[16] = "";
+        int conn_eof = 0;
 
-    /* Read the raw HTTP request until we have the full header block plus
-     * Content-Length bytes of body (the SDP offer).
-     * TODO(whep): no chunked request-body support and no method/path routing —
-     * WHEP clients POST a fixed-length application/sdp body, which this handles.
-     * Also does not enforce whip->authorization (Bearer token) on the request. */
-    while (total < (int)sizeof(reqbuf) - 1) {
-        ret = ffurl_read(whip->whep_conn, (unsigned char *)reqbuf + total,
-                         sizeof(reqbuf) - 1 - total);
-        if (ret == AVERROR(EAGAIN))
-            continue;
-        if (ret <= 0)
-            break;
-        total += ret;
-        reqbuf[total] = '\0';
-        if (hdr_end < 0) {
-            char *p = strstr(reqbuf, "\r\n\r\n");
-            if (p) {
-                char *cl;
-                hdr_end = p - reqbuf;
-                body_start = hdr_end + 4;
-                cl = av_stristr(reqbuf, "Content-Length:");
-                if (cl)
-                    sscanf(cl + strlen("Content-Length:"), "%d", &content_length);
+        if (ff_check_interrupt(&s->interrupt_callback))
+            return AVERROR_EXIT;
+
+        if (!whip->whep_conn) {
+            leftover = 0;
+            ret = ffurl_accept(whip->whep_listener, &whip->whep_conn);
+            if (ret < 0) {
+                av_log(whip, AV_LOG_ERROR, "WHEP failed to accept viewer connection\n");
+                return ret;
             }
         }
-        if (hdr_end >= 0 && content_length >= 0 && total - body_start >= content_length)
-            break;
+
+        /* Read one request: full header block, plus Content-Length bytes of
+         * body when a length was given (OPTIONS/GET carry none). `leftover`
+         * is any pipelined surplus from the previous request on this
+         * connection. */
+        total = leftover;
+        leftover = 0;
+        reqbuf[total] = '\0';
+        hdr_end = -1;
+        content_length = -1;
+        body_start = 0;
+        while (total < (int)sizeof(reqbuf) - 1) {
+            if (hdr_end < 0) {
+                char *p = strstr(reqbuf, "\r\n\r\n");
+                if (p) {
+                    char *cl;
+                    hdr_end = p - reqbuf;
+                    body_start = hdr_end + 4;
+                    cl = av_stristr(reqbuf, "Content-Length:");
+                    if (cl)
+                        sscanf(cl + strlen("Content-Length:"), "%d", &content_length);
+                    sscanf(reqbuf, "%15s", method);
+                }
+            }
+            if (hdr_end >= 0 && (content_length < 0 ||
+                                 total - body_start >= content_length))
+                break;
+            ret = ffurl_read(whip->whep_conn, (unsigned char *)reqbuf + total,
+                             sizeof(reqbuf) - 1 - total);
+            if (ret == AVERROR(EAGAIN)) {
+                av_usleep(1000);
+                continue;
+            }
+            if (ret <= 0) {
+                conn_eof = 1;
+                break;
+            }
+            total += ret;
+            reqbuf[total] = '\0';
+        }
+
+        if (conn_eof || hdr_end < 0) {
+            /* Peer went away mid-request (e.g. the browser opened a FRESH
+             * connection for the POST after its preflight) — accept the next. */
+            ffurl_closep(&whip->whep_conn);
+            continue;
+        }
+        req_end = body_start + (content_length > 0 ? content_length : 0);
+
+        if (!strcmp(method, "OPTIONS")) {
+            static const char preflight[] =
+                "HTTP/1.1 204 No Content\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: POST, OPTIONS, DELETE\r\n"
+                "Access-Control-Allow-Headers: Content-Type, Authorization, If-Match\r\n"
+                "Access-Control-Max-Age: 86400\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n";
+            ret = ffurl_write(whip->whep_conn, preflight, sizeof(preflight) - 1);
+            if (ret < 0) {
+                ffurl_closep(&whip->whep_conn);
+                continue;
+            }
+            av_log(whip, AV_LOG_VERBOSE, "WHEP answered CORS preflight\n");
+            /* Keep-alive: preserve any already-read bytes of the next request. */
+            leftover = total - req_end;
+            if (leftover > 0)
+                memmove(reqbuf, reqbuf + req_end, leftover);
+            continue;
+        }
+
+        if (strcmp(method, "POST") || content_length <= 0 ||
+            !av_strstart(reqbuf + body_start, "v=", NULL)) {
+            static const char reject[] =
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Allow: POST, OPTIONS\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n";
+            av_log(whip, AV_LOG_WARNING, "WHEP rejecting %s request (not an SDP offer POST)\n",
+                   method[0] ? method : "malformed");
+            ffurl_write(whip->whep_conn, reject, sizeof(reject) - 1);
+            ffurl_closep(&whip->whep_conn);
+            continue;
+        }
+
+        /* The SDP offer is the POST body. */
+        body_len = content_length;
+        break;
     }
 
-    if (hdr_end < 0) {
-        av_log(whip, AV_LOG_ERROR, "WHEP malformed HTTP request (no header terminator)\n");
-        return AVERROR(EINVAL);
-    }
-
-    /* The SDP offer is the request body. */
-    body_len = content_length >= 0 ? content_length : total - body_start;
-    if (body_len <= 0 || !av_strstart(reqbuf + body_start, "v=", NULL)) {
-        av_log(whip, AV_LOG_ERROR, "WHEP request body is not an SDP offer\n");
-        return AVERROR(EINVAL);
-    }
     whip->sdp_offer = av_strndup(reqbuf + body_start, body_len);
     if (!whip->sdp_offer)
         return AVERROR(ENOMEM);
@@ -951,6 +1067,7 @@ static int whep_send_answer(AVFormatContext *s)
         "Content-Type: application/sdp\r\n"
         "Location: %s\r\n"
         "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Expose-Headers: Location\r\n"
         "Content-Length: %zu\r\n"
         "\r\n"
         "%s",
@@ -998,6 +1115,7 @@ static int parse_offer(AVFormatContext *s)
     const char *ptr;
     WHIPContext *whip = s->priv_data;
     int have_video_pt = 0, have_audio_pt = 0;
+    int cur_media = 0, nb_mlines = 0;
     /* Collected rtx payload types and their apt= references, resolved after the
      * scan so we can match rtx to the chosen H264 PT regardless of SDP order. */
     struct { int pt, apt; } rtx[8];
@@ -1014,6 +1132,22 @@ static int parse_offer(AVFormatContext *s)
 
     while (!avio_feof(pb)) {
         ff_get_chomp_line(pb, line, sizeof(line));
+        /* Track the offer's m-line order and per-section mids; the answer
+         * must mirror both exactly (JSEP). */
+        if (av_strstart(line, "m=audio", &ptr)) {
+            cur_media = 'a';
+            if (!nb_mlines++)
+                whip->video_mline_first = 0;
+        } else if (av_strstart(line, "m=video", &ptr)) {
+            cur_media = 'v';
+            if (!nb_mlines++)
+                whip->video_mline_first = 1;
+        } else if (av_strstart(line, "a=mid:", &ptr)) {
+            if (cur_media == 'a')
+                av_strlcpy(whip->audio_mid, ptr, sizeof(whip->audio_mid));
+            else if (cur_media == 'v')
+                av_strlcpy(whip->video_mid, ptr, sizeof(whip->video_mid));
+        }
         if (av_strstart(line, "a=ice-lite", &ptr))
             whip->is_peer_ice_lite = 1;
         if (av_strstart(line, "a=ice-ufrag:", &ptr) && !whip->ice_ufrag_remote) {
@@ -1101,13 +1235,16 @@ static int parse_offer(AVFormatContext *s)
             whip->video_rtx_payload_type = rtx[r].pt;
     }
 
-    /* Defensive fallbacks if the offer omitted an rtpmap we expected. */
-    if (whip->video_par && !have_video_pt)
-        whip->video_payload_type = WHIP_RTP_PAYLOAD_TYPE_H264;
-    if (whip->audio_par && !have_audio_pt)
-        whip->audio_payload_type = WHIP_RTP_PAYLOAD_TYPE_OPUS;
-    if (whip->video_par && !whip->video_rtx_payload_type)
-        whip->video_rtx_payload_type = WHIP_RTP_PAYLOAD_TYPE_VIDEO_RTX;
+    /* NO payload-type fallbacks: an answer must not introduce payload types
+     * absent from the offer (JSEP) — a browser rejects it outright ("Answer
+     * had no codecs in common with offer"). If the offer lacks H264/Opus the
+     * session can't be established; validated against our streams after
+     * parse_codec() (video_par/audio_par are not known yet here). Missing rtx
+     * just disables retransmission (video_rtx_payload_type stays 0). */
+    if (!have_video_pt)
+        av_log(whip, AV_LOG_WARNING, "WHEP offer contains no H264 payload type\n");
+    if (!have_audio_pt)
+        av_log(whip, AV_LOG_WARNING, "WHEP offer contains no Opus payload type\n");
 
     if (!whip->ice_pwd_remote || !strlen(whip->ice_pwd_remote)) {
         av_log(whip, AV_LOG_ERROR, "No remote ice pwd parsed from offer\n");
@@ -1287,12 +1424,33 @@ static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint
     avio_wb32(pb, STUN_MAGIC_COOKIE); /* magic cookie */
     avio_write(pb, tid, tid_size); /* transaction ID */
 
-    /* TODO(whep): a fully spec-compliant binding SUCCESS response to a browser
-     * (full ICE agent) SHOULD also carry an XOR-MAPPED-ADDRESS attribute echoing
-     * the peer's transport address (RFC 5389 15.2). Chrome tolerates its absence
-     * for the ice-lite server case in practice, but adding it would make pair
-     * validation more robust. Not implemented here (cannot verify without a
-     * browser). */
+    /* XOR-MAPPED-ADDRESS (RFC 5389 15.2): echo the peer's transport address,
+     * XOR'd with the magic cookie. REQUIRED in practice: a browser (full ICE
+     * agent) will not treat a binding response without it as a valid pair
+     * validation, so it never proceeds to DTLS — observed live as a 5s DTLS
+     * handshake timeout with the browser stuck at ICE "checking". The peer's
+     * address is that of the just-received binding request (the UDP socket's
+     * last-recv address). IPv4 only for now; without it we still respond,
+     * just less usefully. */
+    {
+        struct sockaddr_storage ss;
+        socklen_t ss_len = 0;
+        ff_udp_get_last_recv_addr(whip->udp, &ss, &ss_len);
+        if (ss_len && ss.ss_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)&ss;
+            avio_wb16(pb, 0x0020); /* XOR-MAPPED-ADDRESS */
+            avio_wb16(pb, 8);
+            avio_w8(pb, 0);        /* reserved */
+            avio_w8(pb, 0x01);     /* family: IPv4 */
+            avio_wb16(pb, ntohs(sin->sin_port) ^ (STUN_MAGIC_COOKIE >> 16));
+            avio_wb32(pb, ntohl(sin->sin_addr.s_addr) ^ STUN_MAGIC_COOKIE);
+            av_log(whip, AV_LOG_VERBOSE, "WHEP STUN response with XOR-MAPPED-ADDRESS\n");
+        } else if (ss_len) {
+            av_log(whip, AV_LOG_WARNING,
+                   "WHEP peer is not IPv4; omitting XOR-MAPPED-ADDRESS (family %d)\n",
+                   ss.ss_family);
+        }
+    }
 
     /* Build and update message integrity */
     avio_wb16(pb, STUN_ATTR_MESSAGE_INTEGRITY); /* attribute type message integrity */
@@ -1533,6 +1691,32 @@ next_packet:
         }
         if (ret <= 0)
             goto next_packet;
+
+        /* Per-packet diagnostics: without this, unrecognized packets vanish
+         * silently and "no STUN arrived" is indistinguishable from "STUN
+         * arrived but we dropped it". */
+        {
+            struct sockaddr_storage ss;
+            socklen_t ss_len = 0;
+            char peer[64] = "?";
+            ff_udp_get_last_recv_addr(whip->udp, &ss, &ss_len);
+            if (ss_len && ss.ss_family == AF_INET) {
+                const struct sockaddr_in *sin = (const struct sockaddr_in *)&ss;
+                uint32_t a = ntohl(sin->sin_addr.s_addr);
+                snprintf(peer, sizeof(peer), "%u.%u.%u.%u:%u",
+                         (a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff,
+                         ntohs(sin->sin_port));
+            }
+            av_log(whip, AV_LOG_INFO,
+                   "WHEP rx %d bytes from %s: 0x%02x%02x (%s), state=%d\n",
+                   ret, peer,
+                   (uint8_t)whip->buf[0], (uint8_t)whip->buf[1],
+                   ice_is_binding_request(whip->buf, ret)  ? "STUN binding request" :
+                   ice_is_binding_response(whip->buf, ret) ? "STUN binding response" :
+                   ff_is_dtls_packet(whip->buf, ret)       ? "DTLS" :
+                   media_is_rtp_rtcp(whip->buf, ret)       ? "RTP/RTCP" : "unknown",
+                   whip->state);
+        }
 
         /* Adopt the viewer's address from its first packet so our writes reach it. */
         whep_adopt_peer(s);
@@ -2053,6 +2237,22 @@ static av_cold int whip_init(AVFormatContext *s)
     if ((ret = parse_codec(s)) < 0)
         goto end;
 
+    /* The offer must contain a payload type for every codec we're sending —
+     * we echo the browser's PTs and cannot invent our own (JSEP). */
+    if (whip->video_par && !whip->video_payload_type) {
+        av_log(whip, AV_LOG_ERROR,
+               "WHEP viewer offered no H264 payload type; cannot egress video "
+               "(browser without H264 support?)\n");
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+    if (whip->audio_par && !whip->audio_payload_type) {
+        av_log(whip, AV_LOG_ERROR,
+               "WHEP viewer offered no Opus payload type; cannot egress audio\n");
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+
     if ((ret = udp_bind(s)) < 0)
         goto end;
 
@@ -2115,6 +2315,10 @@ static void handle_rtx_packet(AVFormatContext *s, uint16_t seq)
         av_log(whip, AV_LOG_WARNING, "RTX packet is too large, size=%d\n", ori_size);
         goto end;
     }
+
+    /* rtx not negotiated (offer had no rtx PT) — nothing to retransmit with. */
+    if (!whip->video_rtx_payload_type)
+        goto end;
 
     memcpy(rtx_buf, ori_buf, ori_size);
     ori_seq = AV_RB16(rtx_buf + 2);
