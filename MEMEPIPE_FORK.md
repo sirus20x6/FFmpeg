@@ -11,6 +11,17 @@ One binary we own. Base: FFmpeg 8.0 (master 8ad6288), cloned 2026-07-09.
 
 Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-libopus --enable-openssl --enable-network --disable-doc && make -j`
 
+## IN PRODUCTION (2026-07-10)
+
+memepipe.tv's video path IS this fork: `stream-stager --(fifo)--> mp-ffmpeg
+(playout demuxer -> x264/opus -> WHEP SFU) --(WebRTC)--> browsers`. The main
+watch page negotiates via the Caddy-proxied same-origin `/whep` endpoint;
+media flows direct UDP on the mapped 41000-41063 range. ffplayout and
+MediaMTX are out of the video path (containers kept only as rollback).
+PLAYOUT_ENGINE defaults to `fork` in the stager. Deploy: images built
+locally (`Dockerfile.build` here + stream-stager's `Dockerfile.fork`),
+shipped via docker save/load (server has no BuildKit).
+
 ## Status (2026-07-09, overnight build)
 
 | Piece | State |
