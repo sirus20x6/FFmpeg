@@ -9,7 +9,7 @@ stream-stager  ->  our ffmpeg  ->  video.js
 
 One binary we own. Base: FFmpeg 8.0 (master 8ad6288), cloned 2026-07-09.
 
-Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-openssl --enable-network --disable-doc && make -j`
+Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-libopus --enable-openssl --enable-network --disable-doc && make -j`
 
 ## Status (2026-07-09, overnight build)
 
