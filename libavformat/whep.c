@@ -273,6 +273,25 @@ typedef struct WHIPContext {
     /* The resource URL returned in the Location header of WHIP HTTP response. */
     char *whip_resource_url;
 
+    /* ---- WHEP egress additions ----
+     * WHEP reverses WHIP: FFmpeg is the HTTP *server* and DTLS *server*. For
+     * WHEP the fields above change meaning:
+     *   - sdp_offer  now holds the OFFER *received* from the browser viewer.
+     *   - sdp_answer now holds the ANSWER we *generate* and reply with.
+     */
+    /* HTTP listener socket and the accepted single viewer connection. */
+    URLContext *whep_listener;
+    URLContext *whep_conn;
+    /* The IP advertised in our host ICE candidate in the SDP answer. Because we
+     * are ice-lite/controlled and adopt the peer from its first packet, this is
+     * only used so the browser knows where to send; it must be an address the
+     * browser can reach us on. Defaults to 127.0.0.1 (localhost testing). */
+    char *advertise_ip;
+    /* The local UDP port we bind for media (0 = ephemeral, resolved after bind). */
+    int local_udp_port;
+    /* Set once we have connected our UDP socket to the viewer's address. */
+    int peer_adopted;
+
     /* These variables represent timestamps used for calculating and tracking the cost. */
     int64_t whip_starttime;
     int64_t whip_init_time;
@@ -382,7 +401,9 @@ static av_cold int dtls_initialize(AVFormatContext *s)
     AVDictionary *opts = NULL;
     char buf[256];
 
-    ff_url_join(buf, sizeof(buf), "dtls", NULL, whip->ice_host, whip->ice_port, NULL);
+    /* The DTLS socket is external (shared with our bound UDP), so this URL is
+     * only a label; ice_host may be NULL for WHEP (no candidate in the offer). */
+    ff_url_join(buf, sizeof(buf), "dtls", NULL, whip->ice_host ? whip->ice_host : "0.0.0.0", whip->ice_port, NULL);
     av_dict_set_int(&opts, "mtu", whip->pkt_size, 0);
     if (whip->cert_file) {
         av_dict_set(&opts, "cert_file", whip->cert_file, 0);
@@ -421,6 +442,12 @@ static av_cold int initialize(AVFormatContext *s)
     uint32_t seed;
 
     whip->whip_starttime = av_gettime_relative();
+
+    /* WHEP reversal #1 (DTLS PASSIVE): egress makes FFmpeg the DTLS *server*.
+     * Force-clear the active flag so dtls_initialize() opens OpenSSL with
+     * listen=1 (DTLS_server_method) and adopts the peer from its first packet.
+     * The browser is always the DTLS client (a=setup:active in its offer). */
+    whip->flags &= ~WHIP_DTLS_ACTIVE;
 
     ret = certificate_key_init(s);
     if (ret < 0) {
@@ -598,32 +625,46 @@ static int parse_codec(AVFormatContext *s)
 }
 
 /**
- * Generate SDP offer according to the codec parameters, DTLS and ICE information.
+ * WHEP reversal #4 (generate_sdp_offer -> generate_sdp_answer).
  *
- * Note that we don't use av_sdp_create to generate SDP offer because it doesn't
- * support DTLS and ICE information.
+ * Generate the SDP *answer* that we reply to the browser with. Unlike the WHIP
+ * offer, the answer:
+ *   - MUST echo the browser's negotiated payload types (parsed in parse_offer),
+ *     not hardcode Chrome's H264=106/OPUS=111.
+ *   - advertises a=setup:passive (we are the DTLS server) and a=ice-lite
+ *     (we are the controlled, lite ICE agent).
+ *   - carries ONE host candidate for our bound UDP ip:port so the browser knows
+ *     where to send. We still generate our own ice-ufrag/pwd, SSRCs and use our
+ *     DTLS fingerprint.
+ *
+ * Preconditions: parse_offer() has filled the payload types and udp_bind() has
+ * resolved whip->local_udp_port.
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-static int generate_sdp_offer(AVFormatContext *s)
+static int generate_sdp_answer(AVFormatContext *s)
 {
     int ret = 0, profile_idc = 0, level, profile_iop = 0;
     const char *acodec_name = NULL, *vcodec_name = NULL;
+    const char *cand_ip;
+    unsigned cand_prio = STUN_HOST_CANDIDATE_PRIORITY;
     char bundle[4];
     int bundle_index = 0;
     AVBPrint bp;
     WHIPContext *whip = s->priv_data;
-    int is_dtls_active = whip->flags & WHIP_DTLS_ACTIVE;
 
     /* To prevent a crash during cleanup, always initialize it. */
     av_bprint_init(&bp, 1, MAX_SDP_SIZE);
 
-    if (whip->sdp_offer) {
-        av_log(whip, AV_LOG_ERROR, "SDP offer is already set\n");
+    if (whip->sdp_answer) {
+        av_log(whip, AV_LOG_ERROR, "SDP answer is already set\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
+    cand_ip = whip->advertise_ip ? whip->advertise_ip : "127.0.0.1";
+
+    /* Our (local) ICE credentials and SSRCs. */
     snprintf(whip->ice_ufrag_local, sizeof(whip->ice_ufrag_local), "%08x",
         av_lfg_get(&whip->rnd));
     snprintf(whip->ice_pwd_local, sizeof(whip->ice_pwd_local), "%08x%08x%08x%08x",
@@ -634,9 +675,9 @@ static int generate_sdp_offer(AVFormatContext *s)
     whip->video_ssrc = whip->audio_ssrc + 1;
     whip->video_rtx_ssrc = whip->video_ssrc + 1;
 
-    whip->audio_payload_type = WHIP_RTP_PAYLOAD_TYPE_OPUS;
-    whip->video_payload_type = WHIP_RTP_PAYLOAD_TYPE_H264;
-    whip->video_rtx_payload_type = WHIP_RTP_PAYLOAD_TYPE_VIDEO_RTX;
+    /* NOTE: payload types are NOT hardcoded here anymore — parse_offer() set
+     * whip->{audio,video,video_rtx}_payload_type from the browser's offer so the
+     * answer echoes the exact PT numbers the viewer negotiated. */
 
     if (whip->audio_par) {
         bundle[bundle_index++] = '0';
@@ -648,12 +689,14 @@ static int generate_sdp_offer(AVFormatContext *s)
     }
     bundle[bundle_index - 1] = '\0';
 
+    /* a=ice-lite at session level: we are the lite/controlled agent. */
     av_bprintf(&bp, ""
         "v=0\r\n"
         "o=FFmpeg %s 2 IN IP4 %s\r\n"
-        "s=FFmpegPublishSession\r\n"
+        "s=FFmpegEgressSession\r\n"
         "t=0 0\r\n"
         "a=group:BUNDLE %s\r\n"
+        "a=ice-lite\r\n"
         "a=extmap-allow-mixed\r\n"
         "a=msid-semantic: WMS\r\n",
         WHIP_SDP_SESSION_ID,
@@ -670,23 +713,25 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:%s\r\n"
+            "a=setup:passive\r\n"
             "a=mid:0\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg audio\r\n"
             "a=rtcp-mux\r\n"
             "a=rtpmap:%u %s/%d/%d\r\n"
+            "a=candidate:1 1 udp %u %s %d typ host\r\n"
+            "a=end-of-candidates\r\n"
             "a=ssrc:%u cname:FFmpeg\r\n"
             "a=ssrc:%u msid:FFmpeg audio\r\n",
             whip->audio_payload_type,
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
             whip->dtls_fingerprint,
-            is_dtls_active ? "active" : "passive",
             whip->audio_payload_type,
             acodec_name,
             whip->audio_par->sample_rate,
             whip->audio_par->ch_layout.nb_channels,
+            cand_prio, cand_ip, whip->local_udp_port,
             whip->audio_ssrc,
             whip->audio_ssrc);
     }
@@ -706,7 +751,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=ice-ufrag:%s\r\n"
             "a=ice-pwd:%s\r\n"
             "a=fingerprint:sha-256 %s\r\n"
-            "a=setup:%s\r\n"
+            "a=setup:passive\r\n"
             "a=mid:1\r\n"
             "a=sendonly\r\n"
             "a=msid:FFmpeg video\r\n"
@@ -717,6 +762,8 @@ static int generate_sdp_offer(AVFormatContext *s)
             "a=rtcp-fb:%u nack\r\n"
             "a=rtpmap:%u rtx/90000\r\n"
             "a=fmtp:%u apt=%u\r\n"
+            "a=candidate:1 1 udp %u %s %d typ host\r\n"
+            "a=end-of-candidates\r\n"
             "a=ssrc-group:FID %u %u\r\n"
             "a=ssrc:%u cname:FFmpeg\r\n"
             "a=ssrc:%u msid:FFmpeg video\r\n",
@@ -725,7 +772,6 @@ static int generate_sdp_offer(AVFormatContext *s)
             whip->ice_ufrag_local,
             whip->ice_pwd_local,
             whip->dtls_fingerprint,
-            is_dtls_active ? "active" : "passive",
             whip->video_payload_type,
             vcodec_name,
             whip->video_payload_type,
@@ -736,6 +782,7 @@ static int generate_sdp_offer(AVFormatContext *s)
             whip->video_rtx_payload_type,
             whip->video_rtx_payload_type,
             whip->video_payload_type,
+            cand_prio, cand_ip, whip->local_udp_port,
             whip->video_ssrc,
             whip->video_rtx_ssrc,
             whip->video_ssrc,
@@ -743,122 +790,8 @@ static int generate_sdp_offer(AVFormatContext *s)
     }
 
     if (!av_bprint_is_complete(&bp)) {
-        av_log(whip, AV_LOG_ERROR, "Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
+        av_log(whip, AV_LOG_ERROR, "Answer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
         ret = AVERROR(EIO);
-        goto end;
-    }
-
-    whip->sdp_offer = av_strdup(bp.str);
-    if (!whip->sdp_offer) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    if (whip->state < WHIP_STATE_OFFER)
-        whip->state = WHIP_STATE_OFFER;
-    whip->whip_offer_time = av_gettime_relative();
-    av_log(whip, AV_LOG_VERBOSE, "Generated state=%d, offer: %s\n", whip->state, whip->sdp_offer);
-
-end:
-    av_bprint_finalize(&bp, NULL);
-    return ret;
-}
-
-/**
- * Exchange SDP offer with WebRTC peer to get the answer.
- *
- * @return 0 if OK, AVERROR_xxx on error
- */
-static int exchange_sdp(AVFormatContext *s)
-{
-    int ret;
-    char buf[MAX_URL_SIZE];
-    AVBPrint bp;
-    WHIPContext *whip = s->priv_data;
-    /* The URL context is an HTTP transport layer for the WHIP protocol. */
-    URLContext *whip_uc = NULL;
-    AVDictionary *opts = NULL;
-    char *hex_data = NULL;
-    const char *proto_name = avio_find_protocol_name(s->url);
-
-    /* To prevent a crash during cleanup, always initialize it. */
-    av_bprint_init(&bp, 1, MAX_SDP_SIZE);
-
-    if (!av_strstart(proto_name, "http", NULL)) {
-        av_log(whip, AV_LOG_ERROR, "Protocol %s is not supported by RTC, choose http, url is %s\n",
-            proto_name, s->url);
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    if (!whip->sdp_offer || !strlen(whip->sdp_offer)) {
-        av_log(whip, AV_LOG_ERROR, "No offer to exchange\n");
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    ret = snprintf(buf, sizeof(buf), "Cache-Control: no-cache\r\nContent-Type: application/sdp\r\n");
-    if (whip->authorization)
-        ret += snprintf(buf + ret, sizeof(buf) - ret, "Authorization: Bearer %s\r\n", whip->authorization);
-    if (ret <= 0 || ret >= sizeof(buf)) {
-        av_log(whip, AV_LOG_ERROR, "Failed to generate headers, size=%d, %s\n", ret, buf);
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    av_dict_set(&opts, "headers", buf, 0);
-    av_dict_set_int(&opts, "chunked_post", 0, 0);
-
-    if (whip->timeout >= 0)
-        av_dict_set_int(&opts, "timeout", whip->timeout, 0);
-
-    hex_data = av_mallocz(2 * strlen(whip->sdp_offer) + 1);
-    if (!hex_data) {
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-    ff_data_to_hex(hex_data, whip->sdp_offer, strlen(whip->sdp_offer), 0);
-    av_dict_set(&opts, "post_data", hex_data, 0);
-
-    ret = ffurl_open_whitelist(&whip_uc, s->url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
-        &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
-    if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "Failed to request url=%s, offer: %s\n", s->url, whip->sdp_offer);
-        goto end;
-    }
-
-    if (ff_http_get_new_location(whip_uc)) {
-        whip->whip_resource_url = av_strdup(ff_http_get_new_location(whip_uc));
-        if (!whip->whip_resource_url) {
-            ret = AVERROR(ENOMEM);
-            goto end;
-        }
-    }
-
-    while (1) {
-        ret = ffurl_read(whip_uc, buf, sizeof(buf));
-        if (ret == AVERROR_EOF) {
-            /* Reset the error because we read all response as answer util EOF. */
-            ret = 0;
-            break;
-        }
-        if (ret <= 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to read response from url=%s, offer is %s, answer is %s\n",
-                s->url, whip->sdp_offer, whip->sdp_answer);
-            goto end;
-        }
-
-        av_bprintf(&bp, "%.*s", ret, buf);
-        if (!av_bprint_is_complete(&bp)) {
-            av_log(whip, AV_LOG_ERROR, "Answer exceed max size %d, %.*s, %s\n", MAX_SDP_SIZE, ret, buf, bp.str);
-            ret = AVERROR(EIO);
-            goto end;
-        }
-    }
-
-    if (!av_strstart(bp.str, "v=", NULL)) {
-        av_log(whip, AV_LOG_ERROR, "Invalid answer: %s\n", bp.str);
-        ret = AVERROR(EINVAL);
         goto end;
     }
 
@@ -868,48 +801,218 @@ static int exchange_sdp(AVFormatContext *s)
         goto end;
     }
 
-    if (whip->state < WHIP_STATE_ANSWER)
-        whip->state = WHIP_STATE_ANSWER;
-    av_log(whip, AV_LOG_VERBOSE, "Got state=%d, answer: %s\n", whip->state, whip->sdp_answer);
+    whip->whip_offer_time = av_gettime_relative();
+    av_log(whip, AV_LOG_VERBOSE, "Generated state=%d, answer: %s\n", whip->state, whip->sdp_answer);
 
 end:
-    ffurl_closep(&whip_uc);
     av_bprint_finalize(&bp, NULL);
-    av_dict_free(&opts);
-    av_freep(&hex_data);
     return ret;
 }
 
 /**
- * Parses the ICE ufrag, pwd, and candidates from the SDP answer.
+ * WHEP reversal #2 (exchange_sdp -> HTTP server, part 1: receive the offer).
  *
- * This function is used to extract the ICE ufrag, pwd, and candidates from the SDP answer.
- * It returns an error if any of these fields is NULL. The function only uses the first
- * candidate if there are multiple candidates. However, support for multiple candidates
- * will be added in the future.
+ * Instead of POSTing our offer to a WHIP endpoint as an HTTP client, WHEP makes
+ * FFmpeg the HTTP *server*: we bind+listen on the muxer URL's host:port, accept
+ * one browser connection, and read its POSTed SDP *offer* body. The connection
+ * is kept open in whip->whep_conn so whep_send_answer() can reply with the
+ * answer once it has been generated (the offer must be received BEFORE we can
+ * build the answer, hence this is split into receive/reply halves).
+ *
+ * This uses a minimal hand-rolled HTTP/1.1 request reader over a raw TCP
+ * listener (rather than the http:// protocol's server state machine) so we
+ * control response ordering: read offer -> build answer -> reply 201.
+ *
+ * @return 0 if OK, AVERROR_xxx on error
+ */
+static int whep_serve_offer(AVFormatContext *s)
+{
+    int ret;
+    WHIPContext *whip = s->priv_data;
+    char tcp_url[MAX_URL_SIZE];
+    char proto[16], host[256], path[512];
+    int port = -1;
+    AVDictionary *opts = NULL;
+    /* Request buffer: headers + SDP body. */
+    char reqbuf[MAX_SDP_SIZE * 2];
+    int total = 0, hdr_end = -1, content_length = -1, body_start = 0, body_len;
+    const char *proto_name = avio_find_protocol_name(s->url);
+
+    if (!proto_name || !av_strstart(proto_name, "http", NULL)) {
+        av_log(whip, AV_LOG_ERROR, "WHEP requires an http:// listen URL, got %s\n", s->url);
+        return AVERROR(EINVAL);
+    }
+
+    /* Derive the TCP host:port to bind from the muxer URL. */
+    av_url_split(proto, sizeof(proto), NULL, 0, host, sizeof(host), &port,
+                 path, sizeof(path), s->url);
+    if (port <= 0)
+        port = 80;
+
+    /* tcp listen=2: bind + listen, accept a client separately via ffurl_accept. */
+    ff_url_join(tcp_url, sizeof(tcp_url), "tcp", NULL, host[0] ? host : "0.0.0.0", port, NULL);
+    av_dict_set_int(&opts, "listen", 2, 0);
+    if (whip->timeout >= 0)
+        av_dict_set_int(&opts, "timeout", whip->timeout, 0);
+
+    ret = ffurl_open_whitelist(&whip->whep_listener, tcp_url, AVIO_FLAG_READ_WRITE,
+        &s->interrupt_callback, &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHEP failed to listen on %s\n", tcp_url);
+        return ret;
+    }
+
+    av_log(whip, AV_LOG_INFO, "WHEP listening on %s, waiting for a viewer offer...\n", tcp_url);
+
+    /* Accept exactly one viewer connection (single-viewer target). */
+    ret = ffurl_accept(whip->whep_listener, &whip->whep_conn);
+    if (ret < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHEP failed to accept viewer connection\n");
+        return ret;
+    }
+
+    /* Read the raw HTTP request until we have the full header block plus
+     * Content-Length bytes of body (the SDP offer).
+     * TODO(whep): no chunked request-body support and no method/path routing —
+     * WHEP clients POST a fixed-length application/sdp body, which this handles.
+     * Also does not enforce whip->authorization (Bearer token) on the request. */
+    while (total < (int)sizeof(reqbuf) - 1) {
+        ret = ffurl_read(whip->whep_conn, (unsigned char *)reqbuf + total,
+                         sizeof(reqbuf) - 1 - total);
+        if (ret == AVERROR(EAGAIN))
+            continue;
+        if (ret <= 0)
+            break;
+        total += ret;
+        reqbuf[total] = '\0';
+        if (hdr_end < 0) {
+            char *p = strstr(reqbuf, "\r\n\r\n");
+            if (p) {
+                char *cl;
+                hdr_end = p - reqbuf;
+                body_start = hdr_end + 4;
+                cl = av_stristr(reqbuf, "Content-Length:");
+                if (cl)
+                    sscanf(cl + strlen("Content-Length:"), "%d", &content_length);
+            }
+        }
+        if (hdr_end >= 0 && content_length >= 0 && total - body_start >= content_length)
+            break;
+    }
+
+    if (hdr_end < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHEP malformed HTTP request (no header terminator)\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* The SDP offer is the request body. */
+    body_len = content_length >= 0 ? content_length : total - body_start;
+    if (body_len <= 0 || !av_strstart(reqbuf + body_start, "v=", NULL)) {
+        av_log(whip, AV_LOG_ERROR, "WHEP request body is not an SDP offer\n");
+        return AVERROR(EINVAL);
+    }
+    whip->sdp_offer = av_strndup(reqbuf + body_start, body_len);
+    if (!whip->sdp_offer)
+        return AVERROR(ENOMEM);
+
+    if (whip->state < WHIP_STATE_OFFER)
+        whip->state = WHIP_STATE_OFFER;
+    whip->whip_offer_time = av_gettime_relative();
+    av_log(whip, AV_LOG_VERBOSE, "WHEP received offer:\n%s\n", whip->sdp_offer);
+    return 0;
+}
+
+/**
+ * WHEP reversal #2 (part 2: reply the answer).
+ *
+ * Send "201 Created" with our SDP answer as the body and a Location header, then
+ * the media flows over the separately-bound UDP socket. The HTTP connection is
+ * left for whip_deinit to close.
+ *
+ * @return 0 if OK, AVERROR_xxx on error
+ */
+static int whep_send_answer(AVFormatContext *s)
+{
+    int ret;
+    WHIPContext *whip = s->priv_data;
+    AVBPrint bp;
+
+    if (!whip->sdp_answer || !whip->whep_conn) {
+        av_log(whip, AV_LOG_ERROR, "WHEP has no answer/connection to reply with\n");
+        return AVERROR(EINVAL);
+    }
+
+    av_bprint_init(&bp, 1, MAX_SDP_SIZE + 256);
+    /* Location points back at the muxer URL as the (nominal) session resource.
+     * TODO(whep): we do not implement DELETE on this resource for teardown. */
+    av_bprintf(&bp,
+        "HTTP/1.1 201 Created\r\n"
+        "Content-Type: application/sdp\r\n"
+        "Location: %s\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n"
+        "%s",
+        s->url,
+        strlen(whip->sdp_answer),
+        whip->sdp_answer);
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        return AVERROR(EIO);
+    }
+
+    ret = ffurl_write(whip->whep_conn, bp.str, bp.len);
+    av_bprint_finalize(&bp, NULL);
+    if (ret < 0) {
+        av_log(whip, AV_LOG_ERROR, "WHEP failed to send SDP answer\n");
+        return ret;
+    }
+
+    if (whip->state < WHIP_STATE_ANSWER)
+        whip->state = WHIP_STATE_ANSWER;
+    whip->whip_answer_time = av_gettime_relative();
+    av_log(whip, AV_LOG_VERBOSE, "WHEP sent answer:\n%s\n", whip->sdp_answer);
+    return 0;
+}
+
+/**
+ * WHEP reversal #3 (parse_answer -> parse_offer).
+ *
+ * Parse the browser's SDP *offer* (received in whep_serve_offer). We reuse the
+ * WHIP answer-parsing logic to extract the remote ice-ufrag/ice-pwd/fingerprint
+ * (and, if present, a host candidate — optional here since we adopt the peer
+ * from its first packet). Additionally we read the browser's NEGOTIATED payload
+ * types from its rtpmap/fmtp lines so the answer can echo the exact PT numbers
+ * (do NOT keep the hardcoded Chrome H264=106/OPUS=111).
  *
  * @param s Pointer to the AVFormatContext
  * @returns Returns 0 if successful or AVERROR_xxx if an error occurs.
  */
-static int parse_answer(AVFormatContext *s)
+static int parse_offer(AVFormatContext *s)
 {
     int ret = 0;
     AVIOContext *pb;
     char line[MAX_URL_SIZE];
     const char *ptr;
-    int i;
     WHIPContext *whip = s->priv_data;
+    int have_video_pt = 0, have_audio_pt = 0;
+    /* Collected rtx payload types and their apt= references, resolved after the
+     * scan so we can match rtx to the chosen H264 PT regardless of SDP order. */
+    struct { int pt, apt; } rtx[8];
+    int nb_rtx = 0;
 
-    if (!whip->sdp_answer || !strlen(whip->sdp_answer)) {
-        av_log(whip, AV_LOG_ERROR, "No answer to parse\n");
+    if (!whip->sdp_offer || !strlen(whip->sdp_offer)) {
+        av_log(whip, AV_LOG_ERROR, "No offer to parse\n");
         return AVERROR(EINVAL);
     }
 
-    pb = avio_alloc_context(whip->sdp_answer, strlen(whip->sdp_answer), 0, NULL, NULL, NULL, NULL);
+    pb = avio_alloc_context(whip->sdp_offer, strlen(whip->sdp_offer), 0, NULL, NULL, NULL, NULL);
     if (!pb)
         return AVERROR(ENOMEM);
 
-    for (i = 0; !avio_feof(pb); i++) {
+    while (!avio_feof(pb)) {
         ff_get_chomp_line(pb, line, sizeof(line));
         if (av_strstart(line, "a=ice-lite", &ptr))
             whip->is_peer_ice_lite = 1;
@@ -936,62 +1039,94 @@ static int parse_answer(AVFormatContext *s)
                     goto end;
                 }
             }
+        } else if (av_strstart(line, "a=rtpmap:", &ptr)) {
+            /* a=rtpmap:<pt> <codec>/<clock>[/<ch>] — pick the PTs the browser
+             * offered for H264, Opus and the H264 RTX stream. */
+            int pt = 0;
+            char codec[32] = {0};
+            if (sscanf(ptr, "%d %31[^/]/", &pt, codec) == 2) {
+                if (!av_strcasecmp(codec, "H264") && !have_video_pt) {
+                    whip->video_payload_type = pt;
+                    have_video_pt = 1;
+                } else if (!av_strcasecmp(codec, "opus") && !have_audio_pt) {
+                    whip->audio_payload_type = pt;
+                    have_audio_pt = 1;
+                } else if (!av_strcasecmp(codec, "rtx") && nb_rtx < FF_ARRAY_ELEMS(rtx)) {
+                    rtx[nb_rtx].pt = pt;
+                    rtx[nb_rtx].apt = -1;
+                    nb_rtx++;
+                }
+            }
+        } else if (av_strstart(line, "a=fmtp:", &ptr)) {
+            /* Associate rtx PTs with their apt= (the media PT they retransmit). */
+            int pt = 0, apt = 0;
+            const char *aptp;
+            if (sscanf(ptr, "%d", &pt) == 1 && (aptp = av_stristr(ptr, "apt="))) {
+                if (sscanf(aptp + 4, "%d", &apt) == 1) {
+                    for (int r = 0; r < nb_rtx; r++)
+                        if (rtx[r].pt == pt)
+                            rtx[r].apt = apt;
+                }
+            }
         } else if (av_strstart(line, "a=candidate:", &ptr) && !whip->ice_protocol) {
-            if (ptr && av_stristr(ptr, "host")) {
-                /* Refer to RFC 5245 15.1 */
+            /* Optional for WHEP: the browser is a full ICE agent and we adopt
+             * its transport from the first received packet, so a candidate in
+             * the offer is informational only. Parse a host UDP one if present. */
+            if (ptr && av_stristr(ptr, "typ host")) {
                 char foundation[33], protocol[17], host[129];
                 int component_id, priority, port;
-                ret = sscanf(ptr, "%32s %d %16s %d %128s %d typ host", foundation, &component_id, protocol, &priority, host, &port);
-                if (ret != 6) {
-                    av_log(whip, AV_LOG_ERROR, "Failed %d to parse line %d %s from %s\n",
-                        ret, i, line, whip->sdp_answer);
-                    ret = AVERROR(EIO);
-                    goto end;
-                }
-
-                if (av_strcasecmp(protocol, "udp")) {
-                    av_log(whip, AV_LOG_ERROR, "Protocol %s is not supported by RTC, choose udp, line %d %s of %s\n",
-                        protocol, i, line, whip->sdp_answer);
-                    ret = AVERROR(EIO);
-                    goto end;
-                }
-
-                whip->ice_protocol = av_strdup(protocol);
-                whip->ice_host = av_strdup(host);
-                whip->ice_port = port;
-                if (!whip->ice_protocol || !whip->ice_host) {
-                    ret = AVERROR(ENOMEM);
-                    goto end;
+                if (sscanf(ptr, "%32s %d %16s %d %128s %d typ host",
+                           foundation, &component_id, protocol, &priority, host, &port) == 6 &&
+                    !av_strcasecmp(protocol, "udp")) {
+                    whip->ice_protocol = av_strdup(protocol);
+                    whip->ice_host = av_strdup(host);
+                    whip->ice_port = port;
+                    if (!whip->ice_protocol || !whip->ice_host) {
+                        ret = AVERROR(ENOMEM);
+                        goto end;
+                    }
                 }
             }
         }
     }
 
+    /* Resolve the video RTX payload type: prefer the rtx whose apt matches the
+     * chosen H264 PT; otherwise fall back to the first rtx offered. */
+    for (int r = 0; r < nb_rtx; r++) {
+        if (have_video_pt && rtx[r].apt == whip->video_payload_type) {
+            whip->video_rtx_payload_type = rtx[r].pt;
+            break;
+        }
+        if (r == 0)
+            whip->video_rtx_payload_type = rtx[r].pt;
+    }
+
+    /* Defensive fallbacks if the offer omitted an rtpmap we expected. */
+    if (whip->video_par && !have_video_pt)
+        whip->video_payload_type = WHIP_RTP_PAYLOAD_TYPE_H264;
+    if (whip->audio_par && !have_audio_pt)
+        whip->audio_payload_type = WHIP_RTP_PAYLOAD_TYPE_OPUS;
+    if (whip->video_par && !whip->video_rtx_payload_type)
+        whip->video_rtx_payload_type = WHIP_RTP_PAYLOAD_TYPE_VIDEO_RTX;
+
     if (!whip->ice_pwd_remote || !strlen(whip->ice_pwd_remote)) {
-        av_log(whip, AV_LOG_ERROR, "No remote ice pwd parsed from %s\n", whip->sdp_answer);
+        av_log(whip, AV_LOG_ERROR, "No remote ice pwd parsed from offer\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
     if (!whip->ice_ufrag_remote || !strlen(whip->ice_ufrag_remote)) {
-        av_log(whip, AV_LOG_ERROR, "No remote ice ufrag parsed from %s\n", whip->sdp_answer);
+        av_log(whip, AV_LOG_ERROR, "No remote ice ufrag parsed from offer\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
 
-    if (!whip->ice_protocol || !whip->ice_host || !whip->ice_port) {
-        av_log(whip, AV_LOG_ERROR, "No ice candidate parsed from %s\n", whip->sdp_answer);
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    /* per RFC 8829/8842, SDP answer MUST carry a=fingerprint and that
-     * fingerprint MUST match the DTLS peer certificate. Without it, an
-     * on-path attacker can complete DTLS with an arbitrary self-signed
-     * certificate and the resulting SRTP session is unauthenticated. */
+    /* per RFC 8829/8842, the offer MUST carry a=fingerprint; the DTLS peer
+     * certificate is bound to it. Without it the SRTP session would be
+     * unauthenticated. */
     if (!whip->remote_fingerprint || !strlen(whip->remote_fingerprint)) {
         av_log(whip, AV_LOG_ERROR,
-               "No remote DTLS fingerprint in SDP answer; refusing unauthenticated session\n");
+               "No remote DTLS fingerprint in SDP offer; refusing unauthenticated session\n");
         ret = AVERROR(EINVAL);
         goto end;
     }
@@ -999,9 +1134,10 @@ static int parse_answer(AVFormatContext *s)
     if (whip->state < WHIP_STATE_NEGOTIATED)
         whip->state = WHIP_STATE_NEGOTIATED;
     whip->whip_answer_time = av_gettime_relative();
-    av_log(whip, AV_LOG_VERBOSE, "SDP state=%d, offer=%zuB, answer=%zuB, ufrag=%s, pwd=%zuB, transport=%s://%s:%d, elapsed=%.2fms\n",
-        whip->state, strlen(whip->sdp_offer), strlen(whip->sdp_answer), whip->ice_ufrag_remote, strlen(whip->ice_pwd_remote),
-        whip->ice_protocol, whip->ice_host, whip->ice_port, ELAPSED(whip->whip_starttime, av_gettime_relative()));
+    av_log(whip, AV_LOG_VERBOSE, "SDP state=%d, offer=%zuB, ufrag=%s, pwd=%zuB, video_pt=%d, audio_pt=%d, rtx_pt=%d, elapsed=%.2fms\n",
+        whip->state, strlen(whip->sdp_offer), whip->ice_ufrag_remote, strlen(whip->ice_pwd_remote),
+        whip->video_payload_type, whip->audio_payload_type, whip->video_rtx_payload_type,
+        ELAPSED(whip->whip_starttime, av_gettime_relative()));
 
 end:
     avio_context_free(&pb);
@@ -1020,8 +1156,12 @@ end:
  * @param buf_size Size of the memory buffer
  * @param request_size Pointer to an integer that receives the size of the request packet
  * @return Returns 0 if successful or AVERROR_xxx if an error occurs.
+ *
+ * WHEP reversal #6: as the ice-lite/controlled agent, WHEP NEVER sends binding
+ * requests (no USE-CANDIDATE / ICE-CONTROLLING), so this builder is unused for
+ * egress. Kept (marked av_unused) for reference and any future full-ICE mode.
  */
-static int ice_create_request(AVFormatContext *s, uint8_t *buf, int buf_size, int *request_size)
+static av_unused int ice_create_request(AVFormatContext *s, uint8_t *buf, int buf_size, int *request_size)
 {
     int ret, size, crc32;
     char username[128];
@@ -1147,6 +1287,13 @@ static int ice_create_response(AVFormatContext *s, char *tid, int tid_size, uint
     avio_wb32(pb, STUN_MAGIC_COOKIE); /* magic cookie */
     avio_write(pb, tid, tid_size); /* transaction ID */
 
+    /* TODO(whep): a fully spec-compliant binding SUCCESS response to a browser
+     * (full ICE agent) SHOULD also carry an XOR-MAPPED-ADDRESS attribute echoing
+     * the peer's transport address (RFC 5389 15.2). Chrome tolerates its absence
+     * for the ice-lite server case in practice, but adding it would make pair
+     * validation more robust. Not implemented here (cannot verify without a
+     * browser). */
+
     /* Build and update message integrity */
     avio_wb16(pb, STUN_ATTR_MESSAGE_INTEGRITY); /* attribute type message integrity */
     avio_wb16(pb, 20); /* size of message integrity */
@@ -1255,79 +1402,110 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
 }
 
 /**
- * To establish a connection with the UDP server, we utilize ICE-LITE in a Client-Server
- * mode. In this setup, FFmpeg acts as the UDP client, while the peer functions as the
- * UDP server.
+ * WHEP reversal #5 (udp_connect -> udp_bind).
+ *
+ * For egress we do NOT dial a remote candidate. Instead we BIND a local UDP
+ * port and advertise it in the SDP answer's host candidate. The browser (the
+ * controlling full ICE agent) sends STUN/DTLS/SRTP to us; we adopt its transport
+ * address from the first packet (whep_adopt_peer), after which the socket is
+ * "connected" and ffurl_write reaches the viewer. This mirrors the DTLS-listen
+ * "connect socket to first sender" path in tls_openssl.c.
  */
-static int udp_connect(AVFormatContext *s)
+static int udp_bind(AVFormatContext *s)
 {
     int ret = 0;
     char url[256];
     AVDictionary *opts = NULL;
     WHIPContext *whip = s->priv_data;
+    /* Bind on all interfaces; the advertised candidate IP is a separate option. */
+    const char *bind_ip = "0.0.0.0";
 
-    /* Build UDP URL and create the UDP context as transport. */
-    ff_url_join(url, sizeof(url), "udp", NULL, whip->ice_host, whip->ice_port, NULL);
+    ff_url_join(url, sizeof(url), "udp", NULL, bind_ip, whip->local_udp_port, NULL);
 
-    av_dict_set_int(&opts, "connect", 1, 0);
+    /* connect=0: stay unconnected until we adopt the viewer's address. */
+    av_dict_set_int(&opts, "connect", 0, 0);
     av_dict_set_int(&opts, "fifo_size", 0, 0);
-    /* Pass through the pkt_size and buffer_size to underling protocol */
     av_dict_set_int(&opts, "pkt_size", whip->pkt_size, 0);
     av_dict_set_int(&opts, "buffer_size", whip->ts_buffer_size, 0);
+    if (whip->local_udp_port > 0)
+        av_dict_set_int(&opts, "localport", whip->local_udp_port, 0);
 
-    ret = ffurl_open_whitelist(&whip->udp, url, AVIO_FLAG_WRITE, &s->interrupt_callback,
+    ret = ffurl_open_whitelist(&whip->udp, url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
         &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
     if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "Failed to connect udp://%s:%d\n", whip->ice_host, whip->ice_port);
+        av_log(whip, AV_LOG_ERROR, "WHEP failed to bind udp %s\n", url);
         goto end;
     }
 
-    /* Make the socket non-blocking, set to READ and WRITE mode after connected */
+    /* Resolve the actually-bound port to advertise in the SDP candidate. */
+    whip->local_udp_port = ff_udp_get_local_port(whip->udp);
+
+    /* Make the socket non-blocking, READ|WRITE. */
     ff_socket_nonblock(ffurl_get_file_handle(whip->udp), 1);
     whip->udp->flags |= AVIO_FLAG_READ | AVIO_FLAG_NONBLOCK;
 
     if (whip->state < WHIP_STATE_UDP_CONNECTED)
         whip->state = WHIP_STATE_UDP_CONNECTED;
     whip->whip_udp_time = av_gettime_relative();
-    av_log(whip, AV_LOG_VERBOSE, "UDP state=%d, elapsed=%.2fms, connected to udp://%s:%d\n",
-        whip->state, ELAPSED(whip->whip_starttime, av_gettime_relative()), whip->ice_host, whip->ice_port);
+    av_log(whip, AV_LOG_VERBOSE, "WHEP UDP bound on port %d, state=%d, elapsed=%.2fms\n",
+        whip->local_udp_port, whip->state, ELAPSED(whip->whip_starttime, av_gettime_relative()));
 
 end:
     av_dict_free(&opts);
     return ret;
 }
 
+/**
+ * Adopt the viewer's UDP transport address from the last received packet and
+ * "connect" our bound socket to it, so subsequent ffurl_write() calls (STUN
+ * responses, SRTP media) are delivered to the viewer. Runs once.
+ */
+static void whep_adopt_peer(AVFormatContext *s)
+{
+    WHIPContext *whip = s->priv_data;
+    struct sockaddr_storage addr;
+    socklen_t addr_len = 0;
+
+    if (whip->peer_adopted)
+        return;
+
+    ff_udp_get_last_recv_addr(whip->udp, &addr, &addr_len);
+    if (!addr_len)
+        return;
+
+    if (ff_udp_set_remote_addr(whip->udp, (struct sockaddr *)&addr, addr_len, 1) < 0) {
+        av_log(whip, AV_LOG_WARNING, "WHEP failed to connect UDP socket to viewer\n");
+        return;
+    }
+
+    whip->peer_adopted = 1;
+    av_log(whip, AV_LOG_VERBOSE, "WHEP adopted viewer UDP transport address\n");
+}
+
+/**
+ * WHEP reversal #6/#7 (ICE CONTROLLED + DTLS server handshake).
+ *
+ * As the ice-lite/controlled agent we NEVER send STUN binding *requests*
+ * (no USE-CANDIDATE / ICE-CONTROLLING). We wait for the browser's binding
+ * requests, adopt its transport address from the first packet, answer the
+ * requests, and once a DTLS packet arrives run the DTLS *server* handshake
+ * (SSL_accept via ffurl_handshake on the listen-mode dtls url).
+ */
 static int ice_dtls_handshake(AVFormatContext *s)
 {
-    int ret = 0, size, i;
+    int ret = 0, i;
     int64_t starttime = av_gettime_relative(), now;
     WHIPContext *whip = s->priv_data;
-    int is_dtls_active = whip->flags & WHIP_DTLS_ACTIVE;
 
     if (whip->state < WHIP_STATE_UDP_CONNECTED || !whip->udp) {
         av_log(whip, AV_LOG_ERROR, "UDP not connected, state=%d, udp=%p\n", whip->state, whip->udp);
         return AVERROR(EINVAL);
     }
 
+    if (whip->state < WHIP_STATE_ICE_CONNECTING)
+        whip->state = WHIP_STATE_ICE_CONNECTING;
+
     while (1) {
-        if (whip->state <= WHIP_STATE_ICE_CONNECTING) {
-            /* Build the STUN binding request. */
-            ret = ice_create_request(s, whip->buf, sizeof(whip->buf), &size);
-            if (ret < 0) {
-                av_log(whip, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
-                goto end;
-            }
-
-            ret = ffurl_write(whip->udp, whip->buf, size);
-            if (ret < 0) {
-                av_log(whip, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
-                goto end;
-            }
-
-            if (whip->state < WHIP_STATE_ICE_CONNECTING)
-                whip->state = WHIP_STATE_ICE_CONNECTING;
-        }
-
 next_packet:
         if (whip->state >= WHIP_STATE_DTLS_FINISHED)
             /* DTLS handshake is done, exit the loop. */
@@ -1341,10 +1519,8 @@ next_packet:
             goto end;
         }
 
-        /* Read the STUN or DTLS messages from peer. */
+        /* Passively read STUN/DTLS from the viewer. */
         for (i = 0; i < ICE_DTLS_READ_MAX_RETRY; i++) {
-            if (whip->state > WHIP_STATE_ICE_CONNECTED)
-                break;
             ret = ffurl_read(whip->udp, whip->buf, sizeof(whip->buf));
             if (ret > 0)
                 break;
@@ -1352,41 +1528,48 @@ next_packet:
                 av_usleep(ICE_DTLS_READ_SLEEP_DURATION * WHIP_US_PER_MS);
                 continue;
             }
-            if (is_dtls_active)
-                break;
-            av_log(whip, AV_LOG_ERROR, "Failed to read message\n");
-            goto end;
+            /* Non-fatal for a passive server: keep waiting for the viewer. */
+            break;
         }
+        if (ret <= 0)
+            goto next_packet;
 
-        /* Handle the ICE binding response. */
-        if (ice_is_binding_response(whip->buf, ret)) {
+        /* Adopt the viewer's address from its first packet so our writes reach it. */
+        whep_adopt_peer(s);
+
+        /* Ignore stray binding responses (we never sent a request). */
+        if (ice_is_binding_response(whip->buf, ret))
+            goto next_packet;
+
+        /* Answer the viewer's binding request(s); this establishes ICE. */
+        if (ice_is_binding_request(whip->buf, ret)) {
+            if ((ret = ice_handle_binding_request(s, whip->buf, ret)) < 0)
+                goto end;
             if (whip->state < WHIP_STATE_ICE_CONNECTED) {
-                if (whip->is_peer_ice_lite)
-                    whip->state = WHIP_STATE_ICE_CONNECTED;
+                whip->state = WHIP_STATE_ICE_CONNECTED;
+                whip->whip_ice_time = av_gettime_relative();
+                whip->whip_last_consent_tx_time = whip->whip_last_consent_rx_time = whip->whip_ice_time;
+                av_log(whip, AV_LOG_VERBOSE, "ICE STUN ok (controlled), state=%d, username=%s:%s, elapsed=%.2fms\n",
+                    whip->state, whip->ice_ufrag_local, whip->ice_ufrag_remote,
+                    ELAPSED(whip->whip_starttime, whip->whip_ice_time));
             }
             goto next_packet;
         }
 
-        /* When a binding request is received, it is necessary to respond immediately. */
-        if (ice_is_binding_request(whip->buf, ret)) {
-            if ((ret = ice_handle_binding_request(s, whip->buf, ret)) < 0)
-                goto end;
-            goto next_packet;
-        }
-
-        /* Handle DTLS handshake */
-        if (ff_is_dtls_packet(whip->buf, ret) || is_dtls_active) {
-            whip->whip_ice_time = av_gettime_relative();
-            /* Start consent timer when ICE selected */
-            whip->whip_last_consent_tx_time = whip->whip_last_consent_rx_time = whip->whip_ice_time;
-            whip->state = WHIP_STATE_ICE_CONNECTED;
-            av_log(whip, AV_LOG_VERBOSE, "ICE STUN ok, state=%d, url=udp://%s:%d, location=%s, username=%s:%s, res=%dB, elapsed=%.2fms\n",
-                whip->state, whip->ice_host, whip->ice_port, whip->whip_resource_url ? whip->whip_resource_url : "",
-                whip->ice_ufrag_remote, whip->ice_ufrag_local, ret, ELAPSED(whip->whip_starttime, whip->whip_ice_time));
+        /* DTLS server handshake: the browser (DTLS client) sends ClientHello. */
+        if (ff_is_dtls_packet(whip->buf, ret)) {
+            if (whip->state < WHIP_STATE_ICE_CONNECTED) {
+                whip->state = WHIP_STATE_ICE_CONNECTED;
+                whip->whip_ice_time = av_gettime_relative();
+                whip->whip_last_consent_tx_time = whip->whip_last_consent_rx_time = whip->whip_ice_time;
+            }
 
             ret = dtls_initialize(s);
             if (ret < 0)
                 goto end;
+            /* ffurl_handshake drives SSL_accept to completion (it loops
+             * internally handling DTLS retransmissions of the ClientHello we
+             * just consumed), returning 0 on success or <0 on error. */
             ret = ffurl_handshake(whip->dtls_uc);
             if (ret < 0) {
                 whip->state = WHIP_STATE_FAILED;
@@ -1396,7 +1579,7 @@ next_packet:
             if (!ret) {
                 whip->state = WHIP_STATE_DTLS_FINISHED;
                 whip->whip_dtls_time = av_gettime_relative();
-                av_log(whip, AV_LOG_VERBOSE, "DTLS handshake is done, elapsed=%.2fms\n",
+                av_log(whip, AV_LOG_VERBOSE, "DTLS(server) handshake is done, elapsed=%.2fms\n",
                     ELAPSED(whip->whip_starttime, whip->whip_dtls_time));
             }
             goto next_packet;
@@ -1845,22 +2028,38 @@ static av_cold int whip_init(AVFormatContext *s)
     int ret;
     WHIPContext *whip = s->priv_data;
 
+    /* WHEP reversal #7: egress ordering. We must receive the browser's offer
+     * (as an HTTP server) BEFORE we can parse codecs/PTs and build the answer.
+     *   initialize (DTLS passive)
+     *   -> whep_serve_offer   : HTTP listen + accept + read the offer
+     *   -> parse_offer        : remote ICE creds + negotiated payload types
+     *   -> parse_codec        : validate our input streams
+     *   -> udp_bind           : bind local media port (resolves candidate port)
+     *   -> generate_sdp_answer: setup:passive, ice-lite, echoed PTs, our candidate
+     *   -> whep_send_answer   : reply 201 Created + Location + answer
+     *   -> ice_dtls_handshake : answer STUN (controlled) + DTLS *server* accept
+     *   -> setup_srtp         : role-aware, server keys
+     *   -> create_rtp_muxer   : media flows ffmpeg -> viewer (unchanged)
+     */
     if ((ret = initialize(s)) < 0)
+        goto end;
+
+    if ((ret = whep_serve_offer(s)) < 0)
+        goto end;
+
+    if ((ret = parse_offer(s)) < 0)
         goto end;
 
     if ((ret = parse_codec(s)) < 0)
         goto end;
 
-    if ((ret = generate_sdp_offer(s)) < 0)
+    if ((ret = udp_bind(s)) < 0)
         goto end;
 
-    if ((ret = exchange_sdp(s)) < 0)
+    if ((ret = generate_sdp_answer(s)) < 0)
         goto end;
 
-    if ((ret = parse_answer(s)) < 0)
-        goto end;
-
-    if ((ret = udp_connect(s)) < 0)
+    if ((ret = whep_send_answer(s)) < 0)
         goto end;
 
     if ((ret = ice_dtls_handshake(s)) < 0)
@@ -2019,28 +2218,15 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVFormatContext *rtp_ctx = st->priv_data;
     int64_t now = av_gettime_relative();
     /**
-     * Refer to RFC 7675
-     * Periodically send Consent Freshness STUN Binding Request
+     * WHEP reversal #7 (ICE CONTROLLED consent): as the ice-lite/controlled
+     * agent we do NOT originate consent-freshness binding *requests*. The
+     * browser (controlling agent) sends them to us; we answer below and treat
+     * each answered request as proof of consent (refresh whip_last_consent_rx_time).
      */
-    if (now - whip->whip_last_consent_tx_time > WHIP_ICE_CONSENT_CHECK_INTERVAL * WHIP_US_PER_MS) {
-        int size;
-        ret = ice_create_request(s, whip->buf, sizeof(whip->buf), &size);
-        if (ret < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
-            goto end;
-        }
-        ret = ffurl_write(whip->udp, whip->buf, size);
-        if (ret < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
-            goto end;
-        }
-        whip->whip_last_consent_tx_time = now;
-        av_log(whip, AV_LOG_DEBUG, "Consent Freshness check sent\n");
-    }
 
     /**
-     * Receive packets from the server such as ICE binding requests, DTLS messages,
-     * and RTCP like PLI requests, then respond to them.
+     * Receive packets from the viewer such as ICE binding requests, DTLS
+     * messages, and RTCP (e.g. NACK), then respond to them.
      */
     ret = ffurl_read(whip->udp, whip->buf, sizeof(whip->buf));
     if (ret < 0) {
@@ -2052,6 +2238,14 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (!ret) {
         av_log(whip, AV_LOG_ERROR, "Receive EOF from UDP socket\n");
         goto end;
+    }
+    /* Answer the viewer's ICE consent binding requests to keep the pair alive. */
+    if (ice_is_binding_request(whip->buf, ret)) {
+        if ((ret = ice_handle_binding_request(s, whip->buf, ret)) < 0)
+            goto end;
+        whip->whip_last_consent_rx_time = av_gettime_relative();
+        av_log(whip, AV_LOG_DEBUG, "Consent Freshness request answered\n");
+        goto write_packet;
     }
     if (ice_is_binding_response(whip->buf, ret)) {
         whip->whip_last_consent_rx_time = av_gettime_relative();
@@ -2155,6 +2349,10 @@ static av_cold void whip_deinit(AVFormatContext *s)
     ff_srtp_free(&whip->srtp_recv);
     ffurl_closep(&whip->dtls_uc);
     ffurl_closep(&whip->udp);
+    /* WHEP: close the accepted viewer HTTP connection and the listener. */
+    ffurl_closep(&whip->whep_conn);
+    ffurl_closep(&whip->whep_listener);
+    av_freep(&whip->advertise_ip);
     av_freep(&whip->dtls_fingerprint);
     av_freep(&whip->remote_fingerprint);
 }
@@ -2191,6 +2389,9 @@ static const AVOption options[] = {
     { "authorization",      "The optional Bearer token for WHIP Authorization",         OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
     { "cert_file",          "The optional certificate file path for DTLS",              OFFSET(cert_file),          AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
     { "key_file",           "The optional private key file path for DTLS",              OFFSET(key_file),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
+    /* WHEP egress options. */
+    { "advertise_ip",       "IP to advertise in the WHEP host ICE candidate (viewer must reach us here)", OFFSET(advertise_ip), AV_OPT_TYPE_STRING, { .str = "127.0.0.1" }, 0, 0, ENC },
+    { "local_udp_port",     "Local UDP port to bind for WHEP media (0 = ephemeral)",    OFFSET(local_udp_port),     AV_OPT_TYPE_INT,    { .i64 = 0 },        0, 65535,   ENC },
     { NULL },
 };
 

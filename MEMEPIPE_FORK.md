@@ -17,7 +17,7 @@ Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-ope
 |---|---|
 | Baseline fork configure + build | **done** — `ffmpeg` builds, all libs, 48-core |
 | **mpplayout** (ffplayout's role) | **done + tested** — see below |
-| **whep muxer** (MediaMTX's role) | **scaffolded + registered + compiles**; reversal roadmap below |
+| **whep muxer** (MediaMTX's role) | **reversal implemented + compiles**; needs browser testing (see below) |
 
 ### mpplayout — the playout engine (ffplayout's role)  ✅
 
@@ -45,9 +45,26 @@ directly instead of RTMP-to-MediaMTX.
 ### whep muxer — WebRTC egress (MediaMTX's role)  🚧
 
 `libavformat/whep.c` (fork of `whip.c`), registered in `allformats.c`,
-`Makefile` (`CONFIG_WHEP_MUXER`), `configure` (`whep_muxer_select`). Builds;
-`ffmpeg -muxers` shows `whep`. **Currently a functional clone of WHIP** under its
-own name — the egress reversals are the remaining work.
+`Makefile` (`CONFIG_WHEP_MUXER`), `configure` (`whep_muxer_select`). **The full
+egress reversal is implemented and compiles clean.** Options `advertise_ip`
+(IP for our ICE candidate — set to a browser-reachable address) and
+`local_udp_port`. Init flow is now: initialize → `whep_serve_offer` (HTTP listen
++ accept + read the browser's POSTed offer) → `parse_offer` (remote ICE creds +
+echoed payload types) → parse_codec → `udp_bind` → `generate_sdp_answer`
+(`a=setup:passive`, `a=ice-lite`, `a=sendonly`, echoed PTs, our host candidate)
+→ `whep_send_answer` (201 + Location) → `ice_dtls_handshake` (answer STUN as
+controlled agent, `whep_adopt_peer` from first packet, DTLS **server** accept) →
+setup_srtp (server keys) → create_rtp_muxer (media flows unchanged).
+
+**Not yet done (needs a real browser to test — the only way):**
+- Validate the handshake against `RTCPeerConnection`/video.js (`tools/whep-test.html`,
+  `tools/whep-demo.sh`) and fix what it reveals.
+- Set `advertise_ip` to a browser-reachable address (default 127.0.0.1 = localhost only).
+- The HTTP layer is minimal (no chunked bodies, no `OPTIONS`/CORS, no Bearer auth,
+  no `DELETE` teardown) — harden for non-localhost use.
+- `ice_create_response` omits XOR-MAPPED-ADDRESS — add if pair validation fails.
+- Multi-viewer (SFU): still a single-session muxer; promote to a session list +
+  per-session SRTP for N viewers (see below).
 
 The good news (from reading whip.c): the two hardest WebRTC primitives —
 a **DTLS *server*** handshake over a shared UDP socket and **role-aware SRTP** —
