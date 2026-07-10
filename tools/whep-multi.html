@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WHEP multi-viewer probe</title>
+<!--
+  SFU validation page: opens N concurrent WHEP sessions against the same
+  endpoint and reports each session's ICE/DTLS state + inbound packet counts
+  to the serving origin's /log endpoint (see whep-logserver.py).
+  Params: ?whep=http://host:7891/&n=3&stagger=1500
+  stagger delays each join so mid-stream joins are exercised too.
+-->
+<style>
+  body { font: 13px system-ui; background:#111; color:#eee; margin:1rem; }
+  video { width: 300px; background:#000; margin:2px; }
+</style>
+<div id="grid"></div>
+<script>
+const P = new URLSearchParams(location.search);
+const WHEP = P.get('whep') || 'http://' + location.hostname + ':7891/';
+const N = parseInt(P.get('n') || '3', 10);
+const STAGGER = parseInt(P.get('stagger') || '1500', 10);
+
+function log(msg) { fetch('/log', { method: 'POST', body: msg }).catch(() => {}); }
+window.onerror = m => log('pageerror: ' + m);
+
+async function viewer(i) {
+  const tag = 'v' + i;
+  log(tag + ': join');
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  const vid = document.createElement('video');
+  vid.autoplay = vid.muted = vid.playsInline = true;
+  document.getElementById('grid').appendChild(vid);
+  pc.ontrack = e => { vid.srcObject = e.streams[0]; };
+  pc.oniceconnectionstatechange = () => log(tag + ': ice ' + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => log(tag + ': conn ' + pc.connectionState);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    pc.addEventListener('icegatheringstatechange',
+      () => { if (pc.iceGatheringState === 'complete') res(); });
+    setTimeout(res, 1500);
+  });
+
+  try {
+    const resp = await fetch(WHEP, { method: 'POST',
+      headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+    log(tag + ': http ' + resp.status);
+    if (!resp.ok) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp: await resp.text() });
+    log(tag + ': answer-set');
+  } catch (e) { log(tag + ': error ' + e.message); return; }
+
+  setInterval(async () => {
+    let out = [];
+    (await pc.getStats()).forEach(s => {
+      if (s.type === 'inbound-rtp')
+        out.push(s.kind + ' pk=' + s.packetsReceived +
+                 (s.kind === 'video' ? ' frames=' + (s.framesDecoded ?? '?') : ''));
+    });
+    if (out.length) log(tag + ': ' + out.join(' | '));
+  }, 3000);
+}
+
+(async () => {
+  log('multi start n=' + N + ' whep=' + WHEP);
+  for (let i = 0; i < N; i++) {
+    viewer(i);
+    await new Promise(r => setTimeout(r, STAGGER));
+  }
+})();
+</script>

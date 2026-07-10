@@ -18,7 +18,7 @@ Build: `./configure --enable-gpl --enable-version3 --enable-libx264 --enable-lib
 | Baseline fork configure + build | **done** — `ffmpeg` builds, all libs, 48-core |
 | **mpplayout** (ffplayout's role) | **done + tested** — see below |
 | **playout demuxer** (mpplayout, in-tree) | **done + tested** — `-f playout`, the true integration |
-| **whep muxer** (MediaMTX's role) | **done + browser-verified** — full ladder works vs real Firefox (see below) |
+| **whep muxer** (MediaMTX's role) | **done + browser-verified + multi-viewer SFU implemented** — full ladder works vs real Firefox (see below) |
 
 ### mpplayout — the playout engine (ffplayout's role)  ✅
 
@@ -64,8 +64,70 @@ over 30s, consent keepalives answered. Hard-won lessons, in the order they bit:
    (Firefox `media.peerconnection.ice.loopback=false`; Chrome similar). This
    was the "connecting… nothing happens" root cause. whep now warns; the demo
    auto-detects a routable IP.
-6. whep is **one-shot**: a failed/finished session exits the process (retry =
-   "Failed to fetch"). Multi-session/SFU is the fix (next).
+6. The original one-shot session lifecycle was replaced by the multi-viewer SFU
+   below; failed/finished viewers no longer stop the channel.
+
+#### SFU design (multi-viewer, v1) — implemented + verified 2026-07-10
+
+**VERIFIED: 8/8 concurrent headless-Chromium viewers, staggered joins, all
+decoding at full 30fps** (`tools/whep-sfu-test.sh`). Three bugs found between
+"compiles" and "works", each invisible without instrumentation:
+
+1. **fd leak on accepted connections**: `ffurl_closep()` only calls
+   `url_close` when `is_connected` is set, and an ffurl_accept'ed TCP context
+   never went through `ffurl_connect` — every viewer conn leaked in
+   CLOSE-WAIT, Chrome pooled the never-FIN'd connection and sent the NEXT
+   viewer's POST into it (nobody reads → that viewer hangs forever). Fix:
+   set `conn->is_connected = 1` after accept.
+2. **DTLS handshake flips the UDP socket back to blocking** (same reason
+   whip.c re-asserts NONBLOCK in create_rtp_muxer): each post-handshake read
+   then blocked up to ~1s waiting for viewer consent/RTCP, throttling the
+   WHOLE mux loop to ~3fps. Fix: re-assert nonblock after `ffurl_handshake`.
+3. **Chrome opens speculative TCP connections that never carry data**:
+   reading an accepted conn synchronously stalls the muxer. Fix: accept into
+   a pending queue, serve only when poll() reports data, expire after 5s.
+   (Also: `ff_listen` hardcodes backlog=1 — re-listen() with 32.)
+
+Goal: N concurrent viewers from ONE encode; viewers join/leave without
+touching the process; zero viewers = keep streaming (a live channel must not
+gate on its first viewer). All state that today lives once in WHIPContext
+becomes per-session:
+
+```
+WHEPSession {
+  next;  state;                       // NEGOTIATED→ICE_CONNECTED→DTLS_FINISHED→READY→DEAD
+  ice_ufrag_local/pwd_local           // fresh per session
+  ice_ufrag/pwd_remote, remote_fingerprint
+  audio_pt, video_pt, video_rtx_pt    // echoed from THIS viewer's offer
+  video_mline_first, audio_mid, video_mid
+  udp (own ephemeral port, advertised in THIS session's answer)
+  dtls_uc + srtp_{audio,video,rtx,rtcp}_send + srtp_recv + dtls materials
+  video_rtx_seq, last_consent_rx
+}
+```
+
+Shared: cert/fingerprint, ssrcs (we declare OURS in every answer), rtp history
+(stored PLAIN, pre-encrypt), the rtp muxers.
+
+Flow:
+- init: listen (KEEP listener), parse_codec, create_rtp_muxer with default
+  PTs, return — NO viewer wait. Per-session PT differences are fixed by
+  rewriting the RTP PT byte per session before SRTP (SRTP covers the header,
+  so rewrite-then-encrypt is correct).
+- whip_write_packet: (a) poll-accept (poll() on listener fd, 0 timeout) →
+  read request → OPTIONS=CORS reply / POST=offer → new session: parse offer,
+  bind udp, answer 201, close conn; (b) poll every session's udp: STUN req →
+  respond + consent stamp; DTLS → dtls_initialize(sess)+ffurl_handshake
+  (blocks ~50ms — known v1 stutter on join) → setup_srtp(sess) → READY;
+  RTCP NACK → per-session rtx. Consent expiry (30s) or send error → destroy
+  SESSION, never the process.
+- on_rtp_write_packet: store history once (plain); for each READY session:
+  rewrite PT if it differs, ff_srtp_encrypt with session ctx, write to
+  session->udp. Errors mark the session dead; others unaffected.
+- Joins mid-GOP: viewer waits ≤ GOP for the next IDR (g=60 @30fps = ≤2s);
+  h264_annexb_insert_sps_pps already repeats SPS/PPS at each IDR.
+- v2 later: DELETE on Location (session teardown), Bearer auth, non-blocking
+  DTLS handshake, PLI-triggered keyframe request toward the encoder.
 
 Diagnostics that made this debuggable: per-packet rx logging in the handshake
 loop (size, peer, STUN/DTLS/RTP classification) and a headless-Firefox harness
