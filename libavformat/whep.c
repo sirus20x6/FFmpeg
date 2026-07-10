@@ -317,6 +317,12 @@ typedef struct WHIPContext {
      * only used so the browser knows where to send; it must be an address the
      * browser can reach us on. Defaults to 127.0.0.1 (localhost testing). */
     char *advertise_ip;
+    /* Optional fixed UDP port range for viewer sessions. Ephemeral ports (the
+     * default) cannot be firewall-allowed or NAT-mapped through a container
+     * bridge; with a range, each session binds the first free port in
+     * [udp_port_min, udp_port_max] and the range can be mapped/allowed once. */
+    int udp_port_min;
+    int udp_port_max;
 
     /* These variables represent timestamps used for calculating and tracking the cost. */
     int64_t whip_starttime;
@@ -1712,17 +1718,38 @@ static int udp_bind(AVFormatContext *s, WHEPSession *sess)
     /* Bind on all interfaces; the advertised candidate IP is a separate option. */
     const char *bind_ip = "0.0.0.0";
 
-    ff_url_join(url, sizeof(url), "udp", NULL, bind_ip, 0, NULL);
+    /* With a configured range, bind the first free port in [min,max] so the
+     * whole range can be firewall-allowed / NAT-mapped once. Without one,
+     * port 0 = kernel-chosen ephemeral (localhost/host-network use). */
+    int port_lo = 0, port_hi = 0;
+    if (whip->udp_port_min > 0 && whip->udp_port_max >= whip->udp_port_min) {
+        port_lo = whip->udp_port_min;
+        port_hi = whip->udp_port_max;
+    }
 
-    /* connect=0: stay unconnected until we adopt the viewer's address. */
-    av_dict_set_int(&opts, "connect", 0, 0);
-    av_dict_set_int(&opts, "fifo_size", 0, 0);
-    av_dict_set_int(&opts, "pkt_size", whip->pkt_size, 0);
-    av_dict_set_int(&opts, "buffer_size", whip->ts_buffer_size, 0);
-    ret = ffurl_open_whitelist(&sess->udp, url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
-        &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+    for (int port = port_lo;; port++) {
+        av_dict_free(&opts);
+        opts = NULL;
+        ff_url_join(url, sizeof(url), "udp", NULL, bind_ip, port, NULL);
+
+        /* connect=0: stay unconnected until we adopt the viewer's address. */
+        av_dict_set_int(&opts, "connect", 0, 0);
+        av_dict_set_int(&opts, "fifo_size", 0, 0);
+        av_dict_set_int(&opts, "pkt_size", whip->pkt_size, 0);
+        av_dict_set_int(&opts, "buffer_size", whip->ts_buffer_size, 0);
+        if (port > 0)
+            av_dict_set_int(&opts, "localport", port, 0);
+        ret = ffurl_open_whitelist(&sess->udp, url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
+            &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+        if (ret >= 0)
+            break;
+        if (port == 0 || port >= port_hi) {
+            av_log(whip, AV_LOG_ERROR, "WHEP failed to bind udp %s (range %d-%d exhausted?)\n",
+                   url, port_lo, port_hi);
+            break;
+        }
+    }
     if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "WHEP failed to bind udp %s\n", url);
         goto end;
     }
 
@@ -2869,6 +2896,8 @@ static const AVOption options[] = {
     { "key_file",           "The optional private key file path for DTLS",              OFFSET(key_file),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
     /* WHEP egress options. */
     { "advertise_ip",       "IP to advertise in the WHEP host ICE candidate (viewer must reach us here)", OFFSET(advertise_ip), AV_OPT_TYPE_STRING, { .str = "127.0.0.1" }, 0, 0, ENC },
+    { "udp_port_min",       "Lowest UDP port for viewer sessions (0 = ephemeral)",  OFFSET(udp_port_min), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, ENC },
+    { "udp_port_max",       "Highest UDP port for viewer sessions (with udp_port_min: sessions bind within [min,max], firewall/NAT-mappable)", OFFSET(udp_port_max), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, ENC },
     { NULL },
 };
 

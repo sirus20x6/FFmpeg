@@ -1,0 +1,19 @@
+# Builds the memepipe ffmpeg fork (playout demuxer + WHEP SFU muxer) on
+# debian, producing a glibc binary the stream-stager runtime image can
+# COPY --from. Build:  docker build -f Dockerfile.build -t mp-ffmpeg:local .
+FROM debian:bookworm-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config yasm nasm ca-certificates \
+        libx264-dev libopus-dev libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src
+# distclean any host artifacts that rode in with the COPY, then configure
+# for this container's toolchain.
+RUN make distclean 2>/dev/null; \
+    ./configure --enable-gpl --enable-version3 --enable-libx264 \
+        --enable-libopus --enable-openssl --enable-network \
+        --disable-doc --disable-debug && \
+    make -j"$(nproc)" ffmpeg && \
+    ./ffmpeg -hide_banner -muxers 2>/dev/null | grep -q whep && \
+    ./ffmpeg -hide_banner -demuxers 2>/dev/null | grep -q playout
