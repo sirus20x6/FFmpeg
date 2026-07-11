@@ -119,6 +119,14 @@ static int x509_fingerprint(X509 *cert, char **fingerprint)
     return av_bprint_finalize(&buf, fingerprint);
 }
 
+/* DTLS-SRTP authenticates self-signed WebRTC certificates by comparing the
+ * SDP fingerprint after the handshake. Request the certificate here while
+ * deferring trust to that exact fingerprint comparison. */
+static int accept_dtls_peer_for_fingerprint(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    return 1;
+}
+
 int ff_ssl_read_key_cert(char *key_url, char *cert_url, char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint)
 {
     int ret = 0;
@@ -479,6 +487,21 @@ int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t ma
     return 0;
 }
 
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint)
+{
+    TLSContext *c = h->priv_data;
+    /* SSL_get1_peer_certificate() was only added in OpenSSL 3.0.  The
+     * historical spelling has the same get1/ref-counted semantics and also
+     * works with OpenSSL 1.1.x and LibreSSL, which FFmpeg still supports. */
+    X509 *cert = SSL_get_peer_certificate(c->ssl);
+    int ret;
+    if (!cert)
+        return AVERROR(EACCES);
+    ret = x509_fingerprint(cert, fingerprint);
+    X509_free(cert);
+    return ret;
+}
+
 static int print_ssl_error(URLContext *h, int ret)
 {
     TLSContext *c = h->priv_data;
@@ -812,7 +835,10 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     ret = openssl_init_ca_key_cert(h);
     if (ret < 0) goto fail;
 
-    if (s->verify)
+    if (s->is_dtls && s->use_srtp && s->listen)
+        SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                           accept_dtls_peer_for_fingerprint);
+    else if (s->verify)
         SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 
     if (s->is_dtls && s->use_srtp) {

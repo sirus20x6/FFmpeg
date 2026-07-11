@@ -24,13 +24,21 @@
  *         stop                         end the input (clean EOF)
  *     Movie EOF falls back to the slate and does NOT auto-advance anything.
  *   - All clips must be codec-compatible (we stream-copy packets through;
- *     memepipe's staged library is uniform H.264 + AAC).
+ *     memepipe's staged library is uniform H.264 + AAC). "Compatible" does
+ *     NOT require identical parameter sets: H.264 video is normalized to
+ *     Annex B per clip (h264_mp4toannexb), so each clip's own SPS/PPS ride
+ *     in-band ahead of its IDRs and the downstream decoder re-configures at
+ *     every clip boundary. Without this, AVCC packets from clip N would be
+ *     decoded against clip 1's extradata — grey/cyan garbage whenever the
+ *     parameter sets differ. Audio config changes are signalled with
+ *     AV_PKT_DATA_NEW_EXTRADATA on each clip's first audio packet.
  *
  * Together with the whep muxer this collapses the old
  * stager -> ffplayout -> MediaMTX chain into a single ffmpeg process.
  */
 
 #include <fcntl.h>
+#include <float.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -38,6 +46,8 @@
 #include "libavutil/internal.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/parseutils.h"
+#include "libavcodec/bsf.h"
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
@@ -55,7 +65,11 @@ typedef struct PlayoutContext {
 
     /* options */
     char *control_path;   /* FIFO to read live commands from (NULL = none) */
+    int64_t generation;   /* boot-unique controller generation */
     int   loop;           /* slate sequence repeats; -1 = forever */
+    char *initial_movie;  /* optional codec-seeding movie for this generation */
+    double initial_seek;  /* starting position for initial_movie */
+    int movie_eof_stop;   /* end input rather than switching to codec-incompatible slate */
 
     /* slate program */
     char *slate_buf;                /* strdup'd url, split in place */
@@ -75,6 +89,8 @@ typedef struct PlayoutContext {
     AVFormatContext *cur;
     int cur_is_movie;
     int cur_vin, cur_ain; /* input stream indexes mapped to out 0/1, or -1 */
+    AVBSFContext *v_bsf;  /* per-clip AVCC->Annex B normalizer (H264/HEVC) */
+    int audio_cfg_pending;/* signal this clip's audio extradata downstream */
 
     /* continuous timeline (all in microseconds, AV_TIME_BASE_Q) */
     int64_t offset_us;    /* where the current clip begins on the timeline */
@@ -87,26 +103,107 @@ typedef struct PlayoutContext {
     int  ctl_len;
 
     int open_failures;
+
+    uint64_t last_revision;
+    uint64_t pending_seq;
+    uint64_t pending_revision;
+    char pending_kind[16];
 } PlayoutContext;
 
 /* ---- control ----------------------------------------------------------- */
 
+static void command_result(AVFormatContext *s, int ok, const char *reason)
+{
+    PlayoutContext *c = s->priv_data;
+    if (!c->pending_seq)
+        return;
+
+    av_log(s, ok ? AV_LOG_INFO : AV_LOG_ERROR,
+           "playout: %s %"PRIu64" %"PRId64" %"PRIu64" %s%s%s\n",
+           ok ? "ACK" : "ERR", c->pending_seq, c->generation,
+           c->pending_revision, c->pending_kind,
+           reason ? " " : "", reason ? reason : "");
+    c->pending_seq = 0;
+    c->pending_revision = 0;
+    c->pending_kind[0] = 0;
+}
+
+static int decode_path(char *dst, size_t dst_size, const char *src)
+{
+    size_t n = 0;
+    while (*src) {
+        unsigned v;
+        if (*src == '%' && sscanf(src + 1, "%2x", &v) == 1) {
+            if (v == 0)
+                return AVERROR(EINVAL);
+            if (n + 1 >= dst_size)
+                return AVERROR(ENOSPC);
+            dst[n++] = v;
+            src += 3;
+        } else {
+            if (n + 1 >= dst_size)
+                return AVERROR(ENOSPC);
+            dst[n++] = *src++;
+        }
+    }
+    dst[n] = 0;
+    return 0;
+}
+
+/* Protocol: kind<TAB>seq<TAB>generation<TAB>revision[<TAB>args...].
+ * Paths are percent-encoded, so spaces and control characters cannot corrupt
+ * framing. Every command is fenced by generation and monotonic revision. */
 static void handle_command(AVFormatContext *s, const char *line)
 {
     PlayoutContext *c = s->priv_data;
-    char cmd[64] = "", a1[4096] = "";
-    double a2 = 0;
-    int n = sscanf(line, "%63s %4095s %lf", cmd, a1, &a2);
-    if (n < 1)
-        return;
+    char copy[CTL_BUF_SIZE], *save = NULL, *cmd, *seq_s, *gen_s, *rev_s, *arg1, *arg2;
+    uint64_t seq, rev;
+    int64_t gen;
 
-    if (!strcmp(cmd, "play") && n >= 2) {
-        av_strlcpy(c->movie, a1, sizeof(c->movie));
-        c->movie_seek = n >= 3 ? a2 : 0;
+    av_strlcpy(copy, line, sizeof(copy));
+    cmd = av_strtok(copy, "\t", &save);
+    seq_s = av_strtok(NULL, "\t", &save);
+    gen_s = av_strtok(NULL, "\t", &save);
+    rev_s = av_strtok(NULL, "\t", &save);
+    if (!cmd || !seq_s || !gen_s || !rev_s)
+        goto malformed;
+    seq = strtoull(seq_s, NULL, 10);
+    gen = strtoll(gen_s, NULL, 10);
+    rev = strtoull(rev_s, NULL, 10);
+    if (!seq || !rev)
+        goto malformed;
+    if (gen != c->generation) {
+        av_log(s, AV_LOG_ERROR,
+               "playout: ERR %"PRIu64" %"PRId64" %"PRIu64" %s stale_generation\n",
+               seq, gen, rev, cmd);
+        return;
+    }
+    if (rev <= c->last_revision) {
+        av_log(s, AV_LOG_ERROR,
+               "playout: ERR %"PRIu64" %"PRId64" %"PRIu64" %s stale_revision\n",
+               seq, gen, rev, cmd);
+        return;
+    }
+    if (c->pending_seq)
+        command_result(s, 0, "superseded");
+    c->last_revision = rev;
+    c->pending_seq = seq;
+    c->pending_revision = rev;
+    av_strlcpy(c->pending_kind, cmd, sizeof(c->pending_kind));
+
+    if (!strcmp(cmd, "play")) {
+        arg1 = av_strtok(NULL, "\t", &save); /* seek */
+        arg2 = av_strtok(NULL, "\t", &save); /* encoded path */
+        if (!arg1 || !arg2 || decode_path(c->movie, sizeof(c->movie), arg2) < 0)
+            goto bad_args;
+        c->movie_seek = strtod(arg1, NULL);
         c->switch_pending = 1;
-        av_log(s, AV_LOG_INFO, "playout: [ctl] play %s @%.0f\n", a1, c->movie_seek);
-    } else if (!strcmp(cmd, "seek") && n >= 2) {
-        c->movie_seek = atof(a1);
+        av_log(s, AV_LOG_INFO, "playout: [ctl] play %s @%.0f\n", c->movie, c->movie_seek);
+    } else if (!strcmp(cmd, "seek")) {
+        arg1 = av_strtok(NULL, "\t", &save);
+        if (!arg1 || !c->movie[0])
+            goto bad_args;
+        c->movie_seek = strtod(arg1, NULL);
         c->switch_pending = 1;
         av_log(s, AV_LOG_INFO, "playout: [ctl] seek %.0f\n", c->movie_seek);
     } else if (!strcmp(cmd, "slate")) {
@@ -115,10 +212,18 @@ static void handle_command(AVFormatContext *s, const char *line)
         av_log(s, AV_LOG_INFO, "playout: [ctl] slate\n");
     } else if (!strcmp(cmd, "stop")) {
         c->stop_requested = 1;
+        command_result(s, 1, NULL);
         av_log(s, AV_LOG_INFO, "playout: [ctl] stop\n");
     } else {
-        av_log(s, AV_LOG_WARNING, "playout: [ctl] ignored: %s\n", line);
+        goto bad_args;
     }
+    return;
+
+bad_args:
+    command_result(s, 0, "invalid_arguments");
+    return;
+malformed:
+    av_log(s, AV_LOG_WARNING, "playout: [ctl] malformed command\n");
 }
 
 /* poll_control drains any complete lines from the (non-blocking) FIFO. Called
@@ -156,7 +261,37 @@ static void close_current(PlayoutContext *c)
 {
     if (c->cur)
         avformat_close_input(&c->cur);
+    av_bsf_free(&c->v_bsf);
     c->cur_vin = c->cur_ain = -1;
+}
+
+/* Per-clip Annex B normalizer. The *_mp4toannexb filters pass input that is
+ * already Annex B through untouched, so this is created unconditionally for
+ * H264/HEVC; its par_out carries start-code extradata, which read_header
+ * advertises so the decoder parses in-band parameter sets. */
+static int setup_video_bsf(AVFormatContext *s)
+{
+    PlayoutContext *c = s->priv_data;
+    const AVBitStreamFilter *f = NULL;
+    AVCodecParameters *par;
+    int ret;
+
+    av_bsf_free(&c->v_bsf);
+    if (c->cur_vin < 0)
+        return 0;
+    par = c->cur->streams[c->cur_vin]->codecpar;
+    if (par->codec_id == AV_CODEC_ID_H264)
+        f = av_bsf_get_by_name("h264_mp4toannexb");
+    else if (par->codec_id == AV_CODEC_ID_HEVC)
+        f = av_bsf_get_by_name("hevc_mp4toannexb");
+    if (!f)
+        return 0;
+    if ((ret = av_bsf_alloc(f, &c->v_bsf)) < 0)
+        return ret;
+    if ((ret = avcodec_parameters_copy(c->v_bsf->par_in, par)) < 0)
+        return ret;
+    c->v_bsf->time_base_in = c->cur->streams[c->cur_vin]->time_base;
+    return av_bsf_init(c->v_bsf);
 }
 
 static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
@@ -202,6 +337,13 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
     c->cur_is_movie = is_movie;
     c->offset_us     = c->clip_end_us; /* continue the timeline where it left off */
     c->clip_start_us = AV_NOPTS_VALUE;
+    c->audio_cfg_pending = c->cur_ain >= 0;
+
+    if ((ret = setup_video_bsf(s)) < 0) {
+        av_log(s, AV_LOG_ERROR, "playout: bsf setup %s: %s\n", path, av_err2str(ret));
+        close_current(c);
+        return ret;
+    }
 
     av_log(s, AV_LOG_INFO, "playout: on air: %s%s%s\n",
            is_movie ? "movie " : "slate ", path,
@@ -229,9 +371,11 @@ static int open_next(AVFormatContext *s)
         if (c->movie[0]) {
             if (open_source(s, c->movie, c->movie_seek, 1) >= 0) {
                 c->open_failures = 0;
+                command_result(s, 1, NULL);
                 return 0;
             }
             /* Bad movie: never kill the channel — fall back to slate. */
+            command_result(s, 0, "open_source_failed");
             c->movie[0] = '\0';
             c->open_failures++;
             continue;
@@ -246,6 +390,7 @@ static int open_next(AVFormatContext *s)
         if (open_source(s, c->slates[c->slate_idx], 0, 0) >= 0) {
             c->slate_idx++;
             c->open_failures = 0;
+            command_result(s, 1, NULL);
             return 0;
         }
         c->slate_idx++;
@@ -296,18 +441,33 @@ static int playout_read_header(AVFormatContext *s)
         }
     }
 
-    /* Open the first slate clip and mirror its layout as our output streams:
+    /* A codec-bound generation may start directly on a movie. This is used by
+     * memepipe's zero-video-transcode HEVC path: the first source fixes the
+     * output codec parameters to HEVC and movie EOF terminates the generation,
+     * so it can never fall through to the H.264 slate in the same stream. */
+    if (c->initial_movie && *c->initial_movie) {
+        av_strlcpy(c->movie, c->initial_movie, sizeof(c->movie));
+        c->movie_seek = c->initial_seek;
+    }
+
+    /* Open the first source and mirror its layout as our output streams:
      * stream 0 = video, stream 1 = audio (either may be absent). Every later
      * clip is mapped first-video/first-audio onto this fixed layout. */
     if ((ret = open_next(s)) < 0)
         return ret;
 
+    av_log(s, AV_LOG_INFO, "playout: READY %"PRId64"\n", c->generation);
+
     if (c->cur_vin >= 0) {
         AVStream *st = avformat_new_stream(s, NULL);
         if (!st)
             return AVERROR(ENOMEM);
+        /* Advertise the BSF's par_out when present: its extradata is Annex B
+         * (start codes), which flips the decoder out of AVCC mode so the
+         * per-clip in-band SPS/PPS are honored. */
         if ((ret = avcodec_parameters_copy(st->codecpar,
-                                           c->cur->streams[c->cur_vin]->codecpar)) < 0)
+                                           c->v_bsf ? c->v_bsf->par_out
+                                                    : c->cur->streams[c->cur_vin]->codecpar)) < 0)
             return ret;
         st->codecpar->codec_tag = 0;
         st->avg_frame_rate = c->cur->streams[c->cur_vin]->avg_frame_rate;
@@ -361,6 +521,11 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
                        av_err2str(ret));
             if (c->cur_is_movie) {
                 c->movie[0] = '\0';
+                if (c->movie_eof_stop) {
+                    av_log(s, AV_LOG_INFO, "playout: movie ended; stopping codec-bound generation\n");
+                    close_current(c);
+                    return AVERROR_EOF;
+                }
                 av_log(s, AV_LOG_INFO, "playout: movie ended; back to slate\n");
             }
             close_current(c);
@@ -377,6 +542,31 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (out_idx < 0 || out_idx >= (int)s->nb_streams) {
             av_packet_unref(pkt);
             continue;
+        }
+
+        if (pkt->stream_index == c->cur_vin && c->v_bsf) {
+            /* Normalize AVCC to Annex B so THIS clip's SPS/PPS precede its
+             * IDRs in-band (timestamps pass through unchanged; the filter is
+             * 1-in/1-out, EAGAIN just means it swallowed a packet). */
+            ret = av_bsf_send_packet(c->v_bsf, pkt);
+            if (ret < 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            ret = av_bsf_receive_packet(c->v_bsf, pkt);
+            if (ret < 0)
+                continue;
+        }
+
+        if (pkt->stream_index == c->cur_ain && c->audio_cfg_pending) {
+            AVCodecParameters *apar = c->cur->streams[c->cur_ain]->codecpar;
+            if (apar->extradata_size > 0) {
+                uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                                      apar->extradata_size);
+                if (sd)
+                    memcpy(sd, apar->extradata, apar->extradata_size);
+            }
+            c->audio_cfg_pending = 0;
         }
 
         /* Rebase onto the continuous timeline (µs): rescale, subtract the
@@ -424,8 +614,16 @@ static int playout_read_close(AVFormatContext *s)
 static const AVOption playout_options[] = {
     { "control", "control FIFO path for live commands (play/seek/slate/stop)",
       OFFSET(control_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "generation", "controller generation used to fence stale commands",
+      OFFSET(generation), AV_OPT_TYPE_INT64, { .i64 = 1 }, 1, INT64_MAX, DEC },
     { "loop", "times to play the slate sequence (-1 = forever)",
       OFFSET(loop), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC },
+    { "initial_movie", "start this generation directly on a movie",
+      OFFSET(initial_movie), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "initial_seek", "seek position for initial_movie in seconds",
+      OFFSET(initial_seek), AV_OPT_TYPE_DOUBLE, { .dbl = 0 }, 0, DBL_MAX, DEC },
+    { "movie_eof_stop", "stop at movie EOF instead of falling through to slate",
+      OFFSET(movie_eof_stop), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
     { NULL },
 };
 

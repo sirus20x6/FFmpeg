@@ -326,6 +326,24 @@ int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t ma
     return ret;
 }
 
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint)
+{
+    TLSContext *c = h->priv_data;
+    const mbedtls_x509_crt *cert = mbedtls_ssl_get_peer_cert(&c->ssl_context);
+    unsigned char md[32];
+    AVBPrint bp;
+    int ret;
+    if (!cert)
+        return AVERROR(EACCES);
+    if ((ret = mbedtls_sha256(cert->raw.p, cert->raw.len, md, 0)) != 0)
+        return AVERROR(EIO);
+    av_bprint_init(&bp, sizeof(md) * 3, sizeof(md) * 3);
+    for (int i = 0; i < sizeof(md) - 1; i++)
+        av_bprintf(&bp, "%02X:", md[i]);
+    av_bprintf(&bp, "%02X", md[sizeof(md) - 1]);
+    return av_bprint_finalize(&bp, fingerprint);
+}
+
 #define OFFSET(x) offsetof(TLSContext, x)
 
 static int tls_close(URLContext *h)
@@ -629,7 +647,8 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
 
     // not VERIFY_REQUIRED because we manually check after handshake
     mbedtls_ssl_conf_authmode(&tls_ctx->ssl_config,
-                              shr->verify ? MBEDTLS_SSL_VERIFY_OPTIONAL : MBEDTLS_SSL_VERIFY_NONE);
+                              (shr->verify || (shr->is_dtls && shr->use_srtp && shr->listen))
+                              ? MBEDTLS_SSL_VERIFY_OPTIONAL : MBEDTLS_SSL_VERIFY_NONE);
     mbedtls_ssl_conf_rng(&tls_ctx->ssl_config, mbedtls_ctr_drbg_random, &tls_ctx->ctr_drbg_context);
     mbedtls_ssl_conf_ca_chain(&tls_ctx->ssl_config, &tls_ctx->ca_cert, NULL);
 

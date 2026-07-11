@@ -118,6 +118,9 @@ int ff_tls_set_external_socket(URLContext *h, URLContext *sock);
 
 int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t materials_sz);
 
+/** Return the SHA-256 fingerprint of the certificate presented by the DTLS peer. */
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint);
+
 int ff_ssl_read_key_cert(char *key_url, char *cert_url, char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint);
 
 int ff_ssl_gen_key_cert(char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint);

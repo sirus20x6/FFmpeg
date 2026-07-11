@@ -389,6 +389,25 @@ int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t ma
     return 0;
 }
 
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint)
+{
+    TLSContext *c = h->priv_data;
+    const gnutls_datum_t *peers;
+    unsigned int count = 0;
+    gnutls_x509_crt_t cert;
+    int ret;
+    peers = gnutls_certificate_get_peers(c->session, &count);
+    if (!peers || !count)
+        return AVERROR(EACCES);
+    if ((ret = gnutls_x509_crt_init(&cert)) < 0)
+        return AVERROR(EIO);
+    ret = gnutls_x509_crt_import(cert, &peers[0], GNUTLS_X509_FMT_DER);
+    if (ret >= 0)
+        ret = gnutls_x509_fingerprint(cert, fingerprint);
+    gnutls_x509_crt_deinit(cert);
+    return ret < 0 ? AVERROR(EACCES) : ret;
+}
+
 static int print_tls_error(URLContext *h, int ret)
 {
     TLSContext *c = h->priv_data;
@@ -628,6 +647,8 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     if (!s->listen && !s->numerichost)
         gnutls_server_name_set(c->session, GNUTLS_NAME_DNS, s->host, strlen(s->host));
     gnutls_credentials_set(c->session, GNUTLS_CRD_CERTIFICATE, c->cred);
+    if (s->is_dtls && s->use_srtp && s->listen)
+        gnutls_certificate_server_set_request(c->session, GNUTLS_CERT_REQUIRE);
     gnutls_transport_set_pull_function(c->session, gnutls_url_pull);
     gnutls_transport_set_push_function(c->session, gnutls_url_push);
     gnutls_transport_set_ptr(c->session, c);
