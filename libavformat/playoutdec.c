@@ -54,6 +54,7 @@
 #include "url.h"
 
 #define MAX_SLATES        64
+#define MAX_AUDIO_STREAMS 8
 #define CTL_BUF_SIZE      4096
 /* Consecutive source-open failures before giving up. A bad movie falls back
  * to slate and a bad slate clip is skipped, so only a fully broken program
@@ -88,9 +89,11 @@ typedef struct PlayoutContext {
     /* current nested input */
     AVFormatContext *cur;
     int cur_is_movie;
-    int cur_vin, cur_ain; /* input stream indexes mapped to out 0/1, or -1 */
+    int cur_vin;
+    int cur_ains[MAX_AUDIO_STREAMS]; /* input indexes mapped after video */
+    int nb_cur_ains;
     AVBSFContext *v_bsf;  /* per-clip AVCC->Annex B normalizer (H264/HEVC) */
-    int audio_cfg_pending;/* signal this clip's audio extradata downstream */
+    uint32_t audio_cfg_pending;/* bit per audio output: new extradata */
 
     /* continuous timeline (all in microseconds, AV_TIME_BASE_Q) */
     int64_t offset_us;    /* where the current clip begins on the timeline */
@@ -262,7 +265,8 @@ static void close_current(PlayoutContext *c)
     if (c->cur)
         avformat_close_input(&c->cur);
     av_bsf_free(&c->v_bsf);
-    c->cur_vin = c->cur_ain = -1;
+    c->cur_vin = -1;
+    c->nb_cur_ains = 0;
 }
 
 /* Per-clip Annex B normalizer. The *_mp4toannexb filters pass input that is
@@ -302,6 +306,14 @@ static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
     return -1;
 }
 
+static void collect_audio_streams(PlayoutContext *c)
+{
+    c->nb_cur_ains = 0;
+    for (unsigned i = 0; i < c->cur->nb_streams && c->nb_cur_ains < MAX_AUDIO_STREAMS; i++)
+        if (c->cur->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            c->cur_ains[c->nb_cur_ains++] = i;
+}
+
 /* open_source opens `path` as the current nested input, optionally fast-
  * seeking into it, and anchors it at the current timeline offset. */
 static int open_source(AVFormatContext *s, const char *path, double seek_s, int is_movie)
@@ -333,11 +345,11 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
     }
 
     c->cur_vin = first_stream_of_type(c->cur, AVMEDIA_TYPE_VIDEO);
-    c->cur_ain = first_stream_of_type(c->cur, AVMEDIA_TYPE_AUDIO);
+    collect_audio_streams(c);
     c->cur_is_movie = is_movie;
     c->offset_us     = c->clip_end_us; /* continue the timeline where it left off */
     c->clip_start_us = AV_NOPTS_VALUE;
-    c->audio_cfg_pending = c->cur_ain >= 0;
+    c->audio_cfg_pending = c->nb_cur_ains >= 32 ? UINT32_MAX : ((1U << c->nb_cur_ains) - 1);
 
     if ((ret = setup_video_bsf(s)) < 0) {
         av_log(s, AV_LOG_ERROR, "playout: bsf setup %s: %s\n", path, av_err2str(ret));
@@ -406,7 +418,8 @@ static int playout_read_header(AVFormatContext *s)
     int ret;
 
     c->ctl_fd = -1;
-    c->cur_vin = c->cur_ain = -1;
+    c->cur_vin = -1;
+    c->nb_cur_ains = 0;
     c->clip_start_us = AV_NOPTS_VALUE;
 
     /* Parse the |-separated slate list from the url. */
@@ -460,6 +473,7 @@ static int playout_read_header(AVFormatContext *s)
 
     if (c->cur_vin >= 0) {
         AVStream *st = avformat_new_stream(s, NULL);
+        AVStream *src = c->cur->streams[c->cur_vin];
         if (!st)
             return AVERROR(ENOMEM);
         /* Advertise the BSF's par_out when present: its extradata is Annex B
@@ -472,16 +486,21 @@ static int playout_read_header(AVFormatContext *s)
         st->codecpar->codec_tag = 0;
         st->avg_frame_rate = c->cur->streams[c->cur_vin]->avg_frame_rate;
         st->r_frame_rate   = c->cur->streams[c->cur_vin]->r_frame_rate;
+        st->disposition = src->disposition;
+        av_dict_copy(&st->metadata, src->metadata, 0);
         avpriv_set_pts_info(st, 64, 1, AV_TIME_BASE);
     }
-    if (c->cur_ain >= 0) {
+    for (int ai = 0; ai < c->nb_cur_ains; ai++) {
         AVStream *st = avformat_new_stream(s, NULL);
+        AVStream *src = c->cur->streams[c->cur_ains[ai]];
         if (!st)
             return AVERROR(ENOMEM);
         if ((ret = avcodec_parameters_copy(st->codecpar,
-                                           c->cur->streams[c->cur_ain]->codecpar)) < 0)
+                                           c->cur->streams[c->cur_ains[ai]]->codecpar)) < 0)
             return ret;
         st->codecpar->codec_tag = 0;
+        st->disposition = src->disposition;
+        av_dict_copy(&st->metadata, src->metadata, 0);
         avpriv_set_pts_info(st, 64, 1, AV_TIME_BASE);
     }
     if (!s->nb_streams) {
@@ -537,8 +556,13 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
         int out_idx = -1;
         if (pkt->stream_index == c->cur_vin)
             out_idx = 0;
-        else if (pkt->stream_index == c->cur_ain)
-            out_idx = (c->cur_vin >= 0) ? 1 : 0;
+        else {
+            for (int ai = 0; ai < c->nb_cur_ains; ai++)
+                if (pkt->stream_index == c->cur_ains[ai]) {
+                    out_idx = (c->cur_vin >= 0 ? 1 : 0) + ai;
+                    break;
+                }
+        }
         if (out_idx < 0 || out_idx >= (int)s->nb_streams) {
             av_packet_unref(pkt);
             continue;
@@ -558,15 +582,17 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
                 continue;
         }
 
-        if (pkt->stream_index == c->cur_ain && c->audio_cfg_pending) {
-            AVCodecParameters *apar = c->cur->streams[c->cur_ain]->codecpar;
+        int audio_order = out_idx - (c->cur_vin >= 0 ? 1 : 0);
+        if (audio_order >= 0 && audio_order < c->nb_cur_ains &&
+            (c->audio_cfg_pending & (1U << audio_order))) {
+            AVCodecParameters *apar = c->cur->streams[c->cur_ains[audio_order]]->codecpar;
             if (apar->extradata_size > 0) {
                 uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
                                                       apar->extradata_size);
                 if (sd)
                     memcpy(sd, apar->extradata, apar->extradata_size);
             }
-            c->audio_cfg_pending = 0;
+            c->audio_cfg_pending &= ~(1U << audio_order);
         }
 
         /* Rebase onto the continuous timeline (µs): rescale, subtract the
