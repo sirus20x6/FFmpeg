@@ -139,9 +139,15 @@ typedef struct Output {
 
 static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
 {
-    for (unsigned i = 0; i < ic->nb_streams; i++)
-        if (ic->streams[i]->codecpar->codec_type == type)
+    for (unsigned i = 0; i < ic->nb_streams; i++) {
+        AVStream *st = ic->streams[i];
+
+        if (type == AVMEDIA_TYPE_VIDEO &&
+            (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
+            continue;
+        if (st->codecpar->codec_type == type)
             return (int)i;
+    }
     return -1;
 }
 

@@ -617,21 +617,27 @@ static int url_bio_bputs(BIO *b, const char *str)
     return url_bio_bwrite(b, str, strlen(str));
 }
 
-static av_cold void init_bio_method(URLContext *h)
+static av_cold int init_bio_method(URLContext *h)
 {
     TLSContext *c = h->priv_data;
     BIO *bio;
     c->url_bio_method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "urlprotocol bio");
-    BIO_meth_set_write(c->url_bio_method, url_bio_bwrite);
-    BIO_meth_set_read(c->url_bio_method, url_bio_bread);
-    BIO_meth_set_puts(c->url_bio_method, url_bio_bputs);
-    BIO_meth_set_ctrl(c->url_bio_method, url_bio_ctrl);
-    BIO_meth_set_create(c->url_bio_method, url_bio_create);
-    BIO_meth_set_destroy(c->url_bio_method, url_bio_destroy);
+    if (!c->url_bio_method)
+        return AVERROR(ENOMEM);
+    if (!BIO_meth_set_write(c->url_bio_method, url_bio_bwrite) ||
+        !BIO_meth_set_read(c->url_bio_method, url_bio_bread) ||
+        !BIO_meth_set_puts(c->url_bio_method, url_bio_bputs) ||
+        !BIO_meth_set_ctrl(c->url_bio_method, url_bio_ctrl) ||
+        !BIO_meth_set_create(c->url_bio_method, url_bio_create) ||
+        !BIO_meth_set_destroy(c->url_bio_method, url_bio_destroy))
+        return AVERROR_EXTERNAL;
     bio = BIO_new(c->url_bio_method);
+    if (!bio)
+        return AVERROR(ENOMEM);
     BIO_set_data(bio, c);
 
     SSL_set_bio(c->ssl, bio, bio);
+    return 0;
 }
 
 static void openssl_info_callback(const SSL *ssl, int where, int ret) {
@@ -681,6 +687,24 @@ static int dtls_handshake(URLContext *h)
         if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_ZERO_RETURN) {
             av_log(c, AV_LOG_ERROR, "Handshake failed, ret=%d, err=%d\n", ret, err);
             ret = print_ssl_error(h, ret);
+            goto end;
+        }
+
+        /* A caller that explicitly opened the DTLS URL as nonblocking owns the
+         * progression budget. Do not hide a one-second poll (or the protocol's
+         * 30-second aggregate timeout) inside ffurl_handshake(): WHEP advances
+         * this state machine from a cancellable worker and must be able to honor
+         * its own shorter handshake deadline. OpenSSL requires an explicit timer
+         * tick for DTLS retransmissions, so service an already-expired timer
+         * before yielding EAGAIN. */
+        if (h->flags & AVIO_FLAG_NONBLOCK) {
+            if (DTLSv1_get_timeout(c->ssl, &timeout) &&
+                timeout.tv_sec == 0 && timeout.tv_usec == 0 &&
+                DTLSv1_handle_timeout(c->ssl) < 0) {
+                ret = AVERROR(EIO);
+                goto end;
+            }
+            ret = AVERROR(EAGAIN);
             goto end;
         }
 
@@ -876,7 +900,9 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
         DTLS_set_link_mtu(c->ssl, s->mtu);
     }
 
-    init_bio_method(h);
+    ret = init_bio_method(h);
+    if (ret < 0)
+        goto fail;
     if (!s->listen && !s->numerichost) {
         // By default OpenSSL does too lax wildcard matching
         SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
@@ -906,7 +932,8 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
             // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
             if (ret < 0) {
                 av_log(c, AV_LOG_ERROR, "Failed to drive SSL context, ret=%d\n", ret);
-                return AVERROR(EIO);
+                ret = AVERROR(EIO);
+                goto fail;
             }
         }
         av_log(c, AV_LOG_VERBOSE, "Setup ok, MTU=%d\n", c->tls_shared.mtu);

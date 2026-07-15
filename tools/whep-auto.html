@@ -33,6 +33,7 @@ window.onerror = (m) => log('pageerror: ' + m);
   log('offer-sdp:\n' + pc.localDescription.sdp);
 
   try {
+    log('post-start');
     const resp = await fetch(WHEP, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
     log('http: ' + resp.status);
     if (!resp.ok) return;

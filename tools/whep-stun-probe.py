@@ -108,6 +108,12 @@ pkt = hdr(len(attrs)) + attrs
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(3.0)
+# A random Internet sender can reach an advertised host candidate.  Its
+# unauthenticated Binding-looking datagram must be ignored, not tear down the
+# pending viewer before the browser's authenticated check arrives.
+bogus = struct.pack("!HHI", 0x0001, 0, MAGIC) + os.urandom(12)
+sock.sendto(bogus, (cip, cport))
+print(f"sent unauthenticated STUN probe ({len(bogus)} bytes); session must survive")
 sock.sendto(pkt, (cip, cport))
 print(f"sent STUN binding request ({len(pkt)} bytes) -> {cip}:{cport}")
 

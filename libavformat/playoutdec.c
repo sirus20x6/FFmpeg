@@ -21,6 +21,8 @@
  *         play <path> [seek_seconds]   put a movie on air (interrupts slate)
  *         seek <seconds>               reposition the on-air movie
  *         slate                        back to the slate loop (no autoplay)
+ *         next                         advance to the next slate clip
+ *         publish                      release a held initial movie on air
  *         stop                         end the input (clean EOF)
  *     Movie EOF falls back to the slate and does NOT auto-advance anything.
  *   - All clips must be codec-compatible (we stream-copy packets through;
@@ -37,8 +39,11 @@
  * stager -> ffplayout -> MediaMTX chain into a single ffmpeg process.
  */
 
+#include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <float.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -47,6 +52,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/time.h"
 #include "libavcodec/bsf.h"
 #include "avformat.h"
 #include "demux.h"
@@ -56,6 +62,7 @@
 #define MAX_SLATES        64
 #define MAX_AUDIO_STREAMS 8
 #define CTL_BUF_SIZE      4096
+#define MAX_SEEK_SECONDS  ((INT64_MAX - AV_TIME_BASE) / (double)AV_TIME_BASE)
 /* Consecutive source-open failures before giving up. A bad movie falls back
  * to slate and a bad slate clip is skipped, so only a fully broken program
  * (every source unopenable) can accumulate these. */
@@ -71,6 +78,7 @@ typedef struct PlayoutContext {
     char *initial_movie;  /* optional codec-seeding movie for this generation */
     double initial_seek;  /* starting position for initial_movie */
     int movie_eof_stop;   /* end input rather than switching to codec-incompatible slate */
+    int hold_until_publish; /* expose headers/READY, but emit no packet until publish */
 
     /* slate program */
     char *slate_buf;                /* strdup'd url, split in place */
@@ -85,6 +93,7 @@ typedef struct PlayoutContext {
     double movie_seek;    /* seek point for the next (re)open, seconds */
     int    switch_pending;/* a command changed the program: reopen now */
     int    stop_requested;
+    int    published;     /* first packet may leave the demuxer */
 
     /* current nested input */
     AVFormatContext *cur;
@@ -104,6 +113,7 @@ typedef struct PlayoutContext {
     int  ctl_fd;
     char ctl_buf[CTL_BUF_SIZE];
     int  ctl_len;
+    int  ctl_discarding; /* oversized line: ignore through its newline */
 
     int open_failures;
 
@@ -136,20 +146,73 @@ static int decode_path(char *dst, size_t dst_size, const char *src)
     size_t n = 0;
     while (*src) {
         unsigned v;
-        if (*src == '%' && sscanf(src + 1, "%2x", &v) == 1) {
-            if (v == 0)
+        if (*src == '%') {
+            if (!src[1] || !src[2] ||
+                !isxdigit((unsigned char)src[1]) ||
+                !isxdigit((unsigned char)src[2]))
+                return AVERROR(EINVAL);
+            if (sscanf(src + 1, "%2x", &v) != 1 || v < 0x20 || v == 0x7f)
                 return AVERROR(EINVAL);
             if (n + 1 >= dst_size)
                 return AVERROR(ENOSPC);
             dst[n++] = v;
             src += 3;
         } else {
+            if ((unsigned char)*src < 0x20 || (unsigned char)*src == 0x7f)
+                return AVERROR(EINVAL);
             if (n + 1 >= dst_size)
                 return AVERROR(ENOSPC);
             dst[n++] = *src++;
         }
     }
     dst[n] = 0;
+    return 0;
+}
+
+static int parse_u64(const char *src, uint64_t *dst)
+{
+    char *end = NULL;
+    unsigned long long value;
+
+    if (!src || !*src || isspace((unsigned char)*src) ||
+        *src == '-' || *src == '+')
+        return AVERROR(EINVAL);
+    errno = 0;
+    value = strtoull(src, &end, 10);
+    if (errno || !end || *end || !value)
+        return AVERROR(EINVAL);
+    *dst = value;
+    return 0;
+}
+
+static int parse_i64(const char *src, int64_t *dst)
+{
+    char *end = NULL;
+    long long value;
+
+    if (!src || !*src || isspace((unsigned char)*src))
+        return AVERROR(EINVAL);
+    errno = 0;
+    value = strtoll(src, &end, 10);
+    if (errno || !end || *end || value <= 0)
+        return AVERROR(EINVAL);
+    *dst = value;
+    return 0;
+}
+
+static int parse_seek(const char *src, double *dst)
+{
+    char *end = NULL;
+    double value;
+
+    if (!src || !*src || isspace((unsigned char)*src))
+        return AVERROR(EINVAL);
+    errno = 0;
+    value = strtod(src, &end);
+    if (errno || !end || *end || !isfinite(value) || value < 0 ||
+        value > MAX_SEEK_SECONDS)
+        return AVERROR(EINVAL);
+    *dst = value;
     return 0;
 }
 
@@ -160,6 +223,8 @@ static void handle_command(AVFormatContext *s, const char *line)
 {
     PlayoutContext *c = s->priv_data;
     char copy[CTL_BUF_SIZE], *save = NULL, *cmd, *seq_s, *gen_s, *rev_s, *arg1, *arg2;
+    char movie[sizeof(c->movie)];
+    double seek;
     uint64_t seq, rev;
     int64_t gen;
 
@@ -170,10 +235,9 @@ static void handle_command(AVFormatContext *s, const char *line)
     rev_s = av_strtok(NULL, "\t", &save);
     if (!cmd || !seq_s || !gen_s || !rev_s)
         goto malformed;
-    seq = strtoull(seq_s, NULL, 10);
-    gen = strtoll(gen_s, NULL, 10);
-    rev = strtoull(rev_s, NULL, 10);
-    if (!seq || !rev)
+    if (parse_u64(seq_s, &seq) < 0 ||
+        parse_i64(gen_s, &gen) < 0 ||
+        parse_u64(rev_s, &rev) < 0)
         goto malformed;
     if (gen != c->generation) {
         av_log(s, AV_LOG_ERROR,
@@ -194,26 +258,69 @@ static void handle_command(AVFormatContext *s, const char *line)
     c->pending_revision = rev;
     av_strlcpy(c->pending_kind, cmd, sizeof(c->pending_kind));
 
+    /* A held movie generation is immutable until its durable play claim is
+     * committed.  Only the generation-fenced publish or stop command can
+     * change its state before release. */
+    if (c->hold_until_publish && !c->published &&
+        strcmp(cmd, "publish") && strcmp(cmd, "stop")) {
+        command_result(s, 0, "not_published");
+        return;
+    }
+
     if (!strcmp(cmd, "play")) {
         arg1 = av_strtok(NULL, "\t", &save); /* seek */
         arg2 = av_strtok(NULL, "\t", &save); /* encoded path */
-        if (!arg1 || !arg2 || decode_path(c->movie, sizeof(c->movie), arg2) < 0)
+        if (!arg1 || !arg2 || av_strtok(NULL, "\t", &save) ||
+            parse_seek(arg1, &seek) < 0 ||
+            decode_path(movie, sizeof(movie), arg2) < 0 || !movie[0])
             goto bad_args;
-        c->movie_seek = strtod(arg1, NULL);
+        /* Commit only after every argument has parsed. A malformed encoded
+         * path must not leave a partial movie name or a new seek point live. */
+        av_strlcpy(c->movie, movie, sizeof(c->movie));
+        c->movie_seek = seek;
         c->switch_pending = 1;
         av_log(s, AV_LOG_INFO, "playout: [ctl] play %s @%.0f\n", c->movie, c->movie_seek);
     } else if (!strcmp(cmd, "seek")) {
         arg1 = av_strtok(NULL, "\t", &save);
-        if (!arg1 || !c->movie[0])
+        if (!arg1 || av_strtok(NULL, "\t", &save) || !c->movie[0] ||
+            parse_seek(arg1, &seek) < 0)
             goto bad_args;
-        c->movie_seek = strtod(arg1, NULL);
+        c->movie_seek = seek;
         c->switch_pending = 1;
         av_log(s, AV_LOG_INFO, "playout: [ctl] seek %.0f\n", c->movie_seek);
     } else if (!strcmp(cmd, "slate")) {
+        if (av_strtok(NULL, "\t", &save))
+            goto bad_args;
         c->movie[0] = '\0';
         c->switch_pending = 1;
         av_log(s, AV_LOG_INFO, "playout: [ctl] slate\n");
+    } else if (!strcmp(cmd, "next")) {
+        if (av_strtok(NULL, "\t", &save) || c->movie[0]) {
+            command_result(s, 0, c->movie[0] ? "movie_on_air" : "invalid_arguments");
+            return;
+        }
+        c->switch_pending = 1;
+        av_log(s, AV_LOG_INFO, "playout: [ctl] next slate\n");
+    } else if (!strcmp(cmd, "publish")) {
+        if (av_strtok(NULL, "\t", &save))
+            goto bad_args;
+        if (!c->hold_until_publish) {
+            command_result(s, 0, "not_held");
+            return;
+        }
+        if (c->published) {
+            command_result(s, 0, "already_published");
+            return;
+        }
+        /* Log the ACK before read_packet can return the first packet.  The
+         * controller publishes forkReady/epoch only after observing it. */
+        c->published = 1;
+        command_result(s, 1, NULL);
+        av_log(s, AV_LOG_INFO, "playout: [ctl] publish generation=%"PRId64"\n",
+               c->generation);
     } else if (!strcmp(cmd, "stop")) {
+        if (av_strtok(NULL, "\t", &save))
+            goto bad_args;
         c->stop_requested = 1;
         command_result(s, 1, NULL);
         av_log(s, AV_LOG_INFO, "playout: [ctl] stop\n");
@@ -238,8 +345,10 @@ static void poll_control(AVFormatContext *s)
     if (c->ctl_fd < 0)
         return;
     for (;;) {
-        if (c->ctl_len >= (int)sizeof(c->ctl_buf) - 1)
-            c->ctl_len = 0; /* pathological unterminated line: drop it */
+        if (c->ctl_len >= (int)sizeof(c->ctl_buf) - 1) {
+            c->ctl_len = 0;
+            c->ctl_discarding = 1;
+        }
         ssize_t r = read(c->ctl_fd, c->ctl_buf + c->ctl_len,
                          sizeof(c->ctl_buf) - 1 - c->ctl_len);
         if (r <= 0)
@@ -248,6 +357,15 @@ static void poll_control(AVFormatContext *s)
         c->ctl_buf[c->ctl_len] = '\0';
 
         char *start = c->ctl_buf, *nl;
+        if (c->ctl_discarding) {
+            nl = strchr(start, '\n');
+            if (!nl) {
+                c->ctl_len = 0;
+                continue;
+            }
+            start = nl + 1;
+            c->ctl_discarding = 0;
+        }
         while ((nl = strchr(start, '\n'))) {
             *nl = '\0';
             handle_command(s, start);
@@ -280,7 +398,6 @@ static int setup_video_bsf(AVFormatContext *s)
     AVCodecParameters *par;
     int ret;
 
-    av_bsf_free(&c->v_bsf);
     if (c->cur_vin < 0)
         return 0;
     par = c->cur->streams[c->cur_vin]->codecpar;
@@ -300,9 +417,19 @@ static int setup_video_bsf(AVFormatContext *s)
 
 static int first_stream_of_type(AVFormatContext *ic, enum AVMediaType type)
 {
-    for (unsigned i = 0; i < ic->nb_streams; i++)
-        if (ic->streams[i]->codecpar->codec_type == type)
+    for (unsigned i = 0; i < ic->nb_streams; i++) {
+        AVStream *st = ic->streams[i];
+
+        /* Container artwork is exposed as a video stream by libavformat.
+         * Treating it as the programme video publishes one still frame and
+         * then appears to hang forever.  Match ffmpeg's uppercase V stream
+         * selector and only accept actual moving-picture streams here. */
+        if (type == AVMEDIA_TYPE_VIDEO &&
+            (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
+            continue;
+        if (st->codecpar->codec_type == type)
             return (int)i;
+    }
     return -1;
 }
 
@@ -314,12 +441,55 @@ static void collect_audio_streams(PlayoutContext *c)
             c->cur_ains[c->nb_cur_ains++] = i;
 }
 
+/* The public demuxer layout is fixed by its first clip. Later nested clips
+ * must match that codec topology exactly: relabelling VP9 packets as H.264,
+ * or AC-3 as AAC, makes the outer decoder fail at a source boundary. */
+static int validate_source_layout(AVFormatContext *s, const char *path)
+{
+    PlayoutContext *c = s->priv_data;
+    int expected_video, expected_audio, audio_offset;
+
+    if (!s->nb_streams)
+        return 0;
+    expected_video = s->streams[0]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+    audio_offset = expected_video ? 1 : 0;
+    expected_audio = (int)s->nb_streams - audio_offset;
+
+    if ((c->cur_vin >= 0) != expected_video ||
+        c->nb_cur_ains != expected_audio) {
+        av_log(s, AV_LOG_ERROR,
+               "playout: incompatible stream layout in %s "
+               "(video=%d audio=%d, expected video=%d audio=%d)\n",
+               path, c->cur_vin >= 0, c->nb_cur_ains,
+               expected_video, expected_audio);
+        return AVERROR_INVALIDDATA;
+    }
+    if (expected_video &&
+        c->cur->streams[c->cur_vin]->codecpar->codec_id !=
+        s->streams[0]->codecpar->codec_id) {
+        av_log(s, AV_LOG_ERROR, "playout: incompatible video codec in %s\n", path);
+        return AVERROR_INVALIDDATA;
+    }
+    for (int ai = 0; ai < expected_audio; ai++) {
+        if (c->cur->streams[c->cur_ains[ai]]->codecpar->codec_id !=
+            s->streams[audio_offset + ai]->codecpar->codec_id) {
+            av_log(s, AV_LOG_ERROR,
+                   "playout: incompatible audio codec %d in %s\n", ai, path);
+            return AVERROR_INVALIDDATA;
+        }
+    }
+    return 0;
+}
+
 /* open_source opens `path` as the current nested input, optionally fast-
  * seeking into it, and anchors it at the current timeline offset. */
 static int open_source(AVFormatContext *s, const char *path, double seek_s, int is_movie)
 {
     PlayoutContext *c = s->priv_data;
     int ret;
+
+    if (!isfinite(seek_s) || seek_s < 0 || seek_s > MAX_SEEK_SECONDS)
+        return AVERROR(EINVAL);
 
     close_current(c);
 
@@ -339,13 +509,22 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
     }
     if (seek_s > 0) {
         int64_t ts = (int64_t)(seek_s * AV_TIME_BASE);
-        if (avformat_seek_file(c->cur, -1, INT64_MIN, ts, ts, 0) < 0)
-            av_log(s, AV_LOG_WARNING,
-                   "playout: seek %s to %.1fs failed; playing from start\n", path, seek_s);
+        ret = avformat_seek_file(c->cur, -1, INT64_MIN, ts, ts, 0);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "playout: seek %s to %.1fs failed: %s\n",
+                   path, seek_s, av_err2str(ret));
+            close_current(c);
+            return ret;
+        }
     }
 
     c->cur_vin = first_stream_of_type(c->cur, AVMEDIA_TYPE_VIDEO);
     collect_audio_streams(c);
+    if ((ret = validate_source_layout(s, path)) < 0) {
+        close_current(c);
+        return ret;
+    }
     c->cur_is_movie = is_movie;
     c->offset_us     = c->clip_end_us; /* continue the timeline where it left off */
     c->clip_start_us = AV_NOPTS_VALUE;
@@ -370,6 +549,7 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
 static int open_next(AVFormatContext *s)
 {
     PlayoutContext *c = s->priv_data;
+    int ret;
 
     for (;;) {
         if (c->stop_requested)
@@ -381,13 +561,23 @@ static int open_next(AVFormatContext *s)
 
         c->switch_pending = 0;
         if (c->movie[0]) {
-            if (open_source(s, c->movie, c->movie_seek, 1) >= 0) {
+            ret = open_source(s, c->movie, c->movie_seek, 1);
+            if (ret >= 0) {
                 c->open_failures = 0;
                 command_result(s, 1, NULL);
                 return 0;
             }
-            /* Bad movie: never kill the channel — fall back to slate. */
             command_result(s, 0, "open_source_failed");
+            /* A codec-bound generation cannot expose a slate with different
+             * public codec parameters, and must never claim READY after its
+             * required initial movie failed to open or seek. */
+            if (c->movie_eof_stop) {
+                av_log(s, AV_LOG_ERROR,
+                       "playout: codec-bound movie failed; stopping generation\n");
+                return ret;
+            }
+            /* In the normal slate generation, a bad operator-selected movie
+             * degrades back to the already-compatible slate program. */
             c->movie[0] = '\0';
             c->open_failures++;
             continue;
@@ -421,6 +611,25 @@ static int playout_read_header(AVFormatContext *s)
     c->cur_vin = -1;
     c->nb_cur_ains = 0;
     c->clip_start_us = AV_NOPTS_VALUE;
+    c->published = !c->hold_until_publish;
+
+    if (c->hold_until_publish &&
+        (!c->control_path || !*c->control_path ||
+         !c->initial_movie || !*c->initial_movie || !c->movie_eof_stop)) {
+        av_log(s, AV_LOG_ERROR,
+               "playout: hold_until_publish requires control, initial_movie, "
+               "and movie_eof_stop=1\n");
+        return AVERROR(EINVAL);
+    }
+    if (c->hold_until_publish) {
+        /* open_next() fully probes the nested source before copying its codec
+         * parameters, frame rates, and microsecond time bases below.  Do not
+         * let the outer avformat_find_stream_info() call read_packet merely to
+         * re-estimate FPS/first-DTS: that callback is the admission fence and
+         * must stay parked while the output muxers bind and initialize. */
+        s->fps_probe_size = 0;
+        s->max_ts_probe   = 0;
+    }
 
     /* Parse the |-separated slate list from the url. */
     c->slate_buf = av_strdup(s->url);
@@ -442,23 +651,75 @@ static int playout_read_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    /* Control FIFO: non-blocking, O_RDWR so it never EOFs as writers come and
-     * go; polled from read_packet (single-threaded, no locking anywhere). */
+    /* Control FIFO: the stager creates it before spawning us. Never create or
+     * truncate an arbitrary configured pathname here. lstat rejects symlinks
+     * and non-FIFOs; fstat plus the inode comparison closes the substitution
+     * window between inspection and open. O_RDWR keeps the read side alive as
+     * short-lived writers come and go. */
     if (c->control_path) {
-        mkfifo(c->control_path, 0666); /* EEXIST is fine */
-        c->ctl_fd = open(c->control_path, O_RDWR | O_NONBLOCK);
-        if (c->ctl_fd < 0) {
-            av_log(s, AV_LOG_ERROR, "playout: cannot open control fifo %s\n",
+        struct stat before, after;
+        int flags = O_RDWR | O_NONBLOCK;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        if (lstat(c->control_path, &before) < 0) {
+            ret = AVERROR(errno);
+            av_log(s, AV_LOG_ERROR, "playout: cannot inspect control fifo %s: %s\n",
+                   c->control_path, av_err2str(ret));
+            return ret;
+        }
+        if (!S_ISFIFO(before.st_mode)) {
+            av_log(s, AV_LOG_ERROR, "playout: control path %s is not a FIFO\n",
                    c->control_path);
-            return AVERROR(errno);
+            return AVERROR(EINVAL);
+        }
+        if (before.st_uid != geteuid() ||
+            (before.st_mode & (S_IWGRP | S_IWOTH))) {
+            av_log(s, AV_LOG_ERROR,
+                   "playout: control fifo %s has unsafe owner or write permissions\n",
+                   c->control_path);
+            return AVERROR(EACCES);
+        }
+        c->ctl_fd = open(c->control_path, flags);
+        if (c->ctl_fd < 0) {
+            ret = AVERROR(errno);
+            av_log(s, AV_LOG_ERROR, "playout: cannot open control fifo %s: %s\n",
+                   c->control_path, av_err2str(ret));
+            return ret;
+        }
+        if (fstat(c->ctl_fd, &after) < 0) {
+            ret = AVERROR(errno);
+            av_log(s, AV_LOG_ERROR,
+                   "playout: cannot inspect open control fifo %s: %s\n",
+                   c->control_path, av_err2str(ret));
+            close(c->ctl_fd);
+            c->ctl_fd = -1;
+            return ret;
+        }
+        if (!S_ISFIFO(after.st_mode) || before.st_dev != after.st_dev ||
+            before.st_ino != after.st_ino || after.st_uid != geteuid() ||
+            (after.st_mode & (S_IWGRP | S_IWOTH))) {
+            av_log(s, AV_LOG_ERROR,
+                   "playout: control fifo %s changed while it was opened\n",
+                   c->control_path);
+            close(c->ctl_fd);
+            c->ctl_fd = -1;
+            return AVERROR(EINVAL);
         }
     }
 
-    /* A codec-bound generation may start directly on a movie. This is used by
-     * memepipe's zero-video-transcode HEVC path: the first source fixes the
-     * output codec parameters to HEVC and movie EOF terminates the generation,
-     * so it can never fall through to the H.264 slate in the same stream. */
+    /* A codec-bound generation may start directly on a browser-safe movie.
+     * The first source fixes the public codec parameters and movie EOF
+     * terminates the generation, so it can never fall through to a slate with
+     * a different codec in the same RTP stream. */
     if (c->initial_movie && *c->initial_movie) {
+        if (strlen(c->initial_movie) >= sizeof(c->movie)) {
+            av_log(s, AV_LOG_ERROR, "playout: initial movie path is too long\n");
+            return AVERROR(ENAMETOOLONG);
+        }
         av_strlcpy(c->movie, c->initial_movie, sizeof(c->movie));
         c->movie_seek = c->initial_seek;
     }
@@ -468,8 +729,6 @@ static int playout_read_header(AVFormatContext *s)
      * clip is mapped first-video/first-audio onto this fixed layout. */
     if ((ret = open_next(s)) < 0)
         return ret;
-
-    av_log(s, AV_LOG_INFO, "playout: READY %"PRId64"\n", c->generation);
 
     if (c->cur_vin >= 0) {
         AVStream *st = avformat_new_stream(s, NULL);
@@ -510,6 +769,12 @@ static int playout_read_header(AVFormatContext *s)
 
     /* Endless live program: no total duration. */
     s->duration = 0;
+    /* Controller readiness is only truthful after every public stream and
+     * codec parameter has been installed successfully. */
+    av_log(s, AV_LOG_INFO, "playout: READY %"PRId64"\n", c->generation);
+    if (c->hold_until_publish)
+        av_log(s, AV_LOG_INFO, "playout: HOLD %"PRId64" awaiting publish\n",
+               c->generation);
     return 0;
 }
 
@@ -524,6 +789,15 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
             return AVERROR_EOF;
         if (ff_check_interrupt(&s->interrupt_callback))
             return AVERROR_EXIT;
+
+        /* Keep the nested input parked at its configured seek point.  This
+         * demuxer thread sleeps in bounded increments so publish/stop and the
+         * interrupt callback remain responsive, while no output muxer packet
+         * callback (WHEP HTTP/RTP or CMAF) can run before authorization. */
+        if (!c->published) {
+            av_usleep(1000);
+            continue;
+        }
 
         if (c->switch_pending || !c->cur) {
             if ((ret = open_next(s)) < 0)
@@ -589,8 +863,11 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (apar->extradata_size > 0) {
                 uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
                                                       apar->extradata_size);
-                if (sd)
-                    memcpy(sd, apar->extradata, apar->extradata_size);
+                if (!sd) {
+                    av_packet_unref(pkt);
+                    return AVERROR(ENOMEM);
+                }
+                memcpy(sd, apar->extradata, apar->extradata_size);
             }
             c->audio_cfg_pending &= ~(1U << audio_order);
         }
@@ -608,12 +885,16 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
             c->clip_start_us = dts_us != AV_NOPTS_VALUE ? dts_us
                              : pts_us != AV_NOPTS_VALUE ? pts_us : 0;
 
+        int64_t timeline_delta = av_sat_sub64(c->offset_us, c->clip_start_us);
         if (pts_us != AV_NOPTS_VALUE)
-            pts_us += c->offset_us - c->clip_start_us;
-        if (dts_us != AV_NOPTS_VALUE) {
-            dts_us += c->offset_us - c->clip_start_us;
-            if (dts_us + dur_us > c->clip_end_us)
-                c->clip_end_us = dts_us + dur_us;
+            pts_us = av_sat_add64(pts_us, timeline_delta);
+        if (dts_us != AV_NOPTS_VALUE)
+            dts_us = av_sat_add64(dts_us, timeline_delta);
+        int64_t packet_end_us = FFMAX(dts_us, pts_us);
+        if (packet_end_us != AV_NOPTS_VALUE) {
+            int64_t end_us = av_sat_add64(packet_end_us, dur_us);
+            if (end_us > c->clip_end_us)
+                c->clip_end_us = end_us;
         }
 
         pkt->pts = pts_us;
@@ -638,7 +919,7 @@ static int playout_read_close(AVFormatContext *s)
 #define OFFSET(x) offsetof(PlayoutContext, x)
 #define DEC AV_OPT_FLAG_DECODING_PARAM
 static const AVOption playout_options[] = {
-    { "control", "control FIFO path for live commands (play/seek/slate/stop)",
+    { "control", "control FIFO path for live commands (play/seek/slate/next/publish/stop)",
       OFFSET(control_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
     { "generation", "controller generation used to fence stale commands",
       OFFSET(generation), AV_OPT_TYPE_INT64, { .i64 = 1 }, 1, INT64_MAX, DEC },
@@ -647,9 +928,11 @@ static const AVOption playout_options[] = {
     { "initial_movie", "start this generation directly on a movie",
       OFFSET(initial_movie), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
     { "initial_seek", "seek position for initial_movie in seconds",
-      OFFSET(initial_seek), AV_OPT_TYPE_DOUBLE, { .dbl = 0 }, 0, DBL_MAX, DEC },
+      OFFSET(initial_seek), AV_OPT_TYPE_DOUBLE, { .dbl = 0 }, 0, MAX_SEEK_SECONDS, DEC },
     { "movie_eof_stop", "stop at movie EOF instead of falling through to slate",
       OFFSET(movie_eof_stop), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
+    { "hold_until_publish", "emit no initial-movie packets until a fenced publish command",
+      OFFSET(hold_until_publish), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
     { NULL },
 };
 
