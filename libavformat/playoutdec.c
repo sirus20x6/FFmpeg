@@ -67,6 +67,11 @@
  * to slate and a bad slate clip is skipped, so only a fully broken program
  * (every source unopenable) can accumulate these. */
 #define MAX_OPEN_FAILURES 50
+/* Direct-WHEP admission proves a four-second maximum keyframe gap. Keep the
+ * demuxer-side scan independently bounded so a corrupt/replaced input can
+ * never turn an operator seek into an unbounded read. */
+#define MAX_SEEK_KEYFRAME_OVERSHOOT_US (5LL * AV_TIME_BASE)
+#define MAX_SEEK_SCAN_PACKETS          (1U << 20)
 
 typedef struct PlayoutContext {
     const AVClass *class;
@@ -102,12 +107,14 @@ typedef struct PlayoutContext {
     int cur_ains[MAX_AUDIO_STREAMS]; /* input indexes mapped after video */
     int nb_cur_ains;
     AVBSFContext *v_bsf;  /* per-clip AVCC->Annex B normalizer (H264/HEVC) */
+    AVPacket *pending_pkt;/* first decodable packet retained by forward seek */
     uint32_t audio_cfg_pending;/* bit per audio output: new extradata */
 
     /* continuous timeline (all in microseconds, AV_TIME_BASE_Q) */
     int64_t offset_us;    /* where the current clip begins on the timeline */
     int64_t clip_start_us;/* first dts of the current clip (AV_NOPTS until seen) */
     int64_t clip_end_us;  /* running end of the timeline */
+    int64_t seek_target_us;/* nested absolute landing; older packets are dropped */
 
     /* control FIFO (non-blocking, polled from read_packet) */
     int  ctl_fd;
@@ -380,11 +387,86 @@ static void poll_control(AVFormatContext *s)
 
 static void close_current(PlayoutContext *c)
 {
+    av_packet_free(&c->pending_pkt);
     if (c->cur)
         avformat_close_input(&c->cur);
     av_bsf_free(&c->v_bsf);
     c->cur_vin = -1;
     c->nb_cur_ains = 0;
+}
+
+/* Stream-copy output cannot use AV_PKT_FLAG_DISCARD as decoder preroll: RTP
+ * has no equivalent flag, so a browser would actually display the packets.
+ * Seek forward to the first video keyframe at or after the requested source
+ * position and retain that packet as the first packet returned by this
+ * demuxer. The direct-media contract bounds the normal overshoot to four
+ * seconds; the explicit limits below fail closed on media that violates it. */
+static int seek_to_decodable_keyframe(AVFormatContext *s, int64_t target_us,
+                                      int64_t *landed_us)
+{
+    PlayoutContext *c = s->priv_data;
+    AVPacket *pkt = NULL;
+    int64_t earliest_us = av_sat_sub64(target_us,
+                                       MAX_SEEK_KEYFRAME_OVERSHOOT_US);
+    unsigned packets = 0;
+    int ret;
+
+    /* Position at the closest acceptable keyframe on/before the target, then
+     * scan in decode order. This makes the selected packet the FIRST keyframe
+     * at/after target even for demuxers using avformat_seek_file's old-API
+     * fallback; min=target/max=INT64_MAX alone could let such a fallback skip
+     * a nearer forward keyframe. No packet from this backward anchor is ever
+     * exposed by the outer demuxer. */
+    ret = avformat_seek_file(c->cur, -1, earliest_us, target_us, target_us, 0);
+    if (ret < 0)
+        return ret;
+
+    pkt = av_packet_alloc();
+    if (!pkt)
+        return AVERROR(ENOMEM);
+
+    while (packets++ < MAX_SEEK_SCAN_PACKETS) {
+        AVStream *stream;
+        int64_t pts_us, dts_us, presentation_us;
+
+        ret = av_read_frame(c->cur, pkt);
+        if (ret < 0)
+            goto fail;
+        if (pkt->stream_index != c->cur_vin) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        stream = c->cur->streams[pkt->stream_index];
+        pts_us = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+               : av_rescale_q(pkt->pts, stream->time_base, AV_TIME_BASE_Q);
+        dts_us = pkt->dts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
+               : av_rescale_q(pkt->dts, stream->time_base, AV_TIME_BASE_Q);
+        presentation_us = pts_us != AV_NOPTS_VALUE ? pts_us : dts_us;
+        if (presentation_us == AV_NOPTS_VALUE) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (presentation_us < earliest_us) {
+            ret = AVERROR(ERANGE);
+            goto fail;
+        }
+        if (presentation_us > av_sat_add64(target_us,
+                                           MAX_SEEK_KEYFRAME_OVERSHOOT_US)) {
+            ret = AVERROR(ERANGE);
+            goto fail;
+        }
+        if (presentation_us >= target_us && (pkt->flags & AV_PKT_FLAG_KEY)) {
+            c->pending_pkt = pkt;
+            *landed_us = presentation_us;
+            return 0;
+        }
+        av_packet_unref(pkt);
+    }
+    ret = AVERROR(ERANGE);
+
+fail:
+    av_packet_free(&pkt);
+    return ret;
 }
 
 /* Per-clip Annex B normalizer. The *_mp4toannexb filters pass input that is
@@ -481,11 +563,14 @@ static int validate_source_layout(AVFormatContext *s, const char *path)
     return 0;
 }
 
-/* open_source opens `path` as the current nested input, optionally fast-
- * seeking into it, and anchors it at the current timeline offset. */
+/* open_source opens `path` as the current nested input, seeks movies onto a
+ * forward independently-decodable keyframe, and anchors the result at the
+ * current timeline offset. */
 static int open_source(AVFormatContext *s, const char *path, double seek_s, int is_movie)
 {
     PlayoutContext *c = s->priv_data;
+    int64_t seek_target_us = AV_NOPTS_VALUE;
+    int64_t landed_relative_us = 0;
     int ret;
 
     if (!isfinite(seek_s) || seek_s < 0 || seek_s > MAX_SEEK_SECONDS)
@@ -507,27 +592,40 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
         close_current(c);
         return ret;
     }
-    if (seek_s > 0) {
-        int64_t ts = (int64_t)(seek_s * AV_TIME_BASE);
-        ret = avformat_seek_file(c->cur, -1, INT64_MIN, ts, ts, 0);
-        if (ret < 0) {
-            av_log(s, AV_LOG_ERROR,
-                   "playout: seek %s to %.1fs failed: %s\n",
-                   path, seek_s, av_err2str(ret));
-            close_current(c);
-            return ret;
-        }
-    }
-
     c->cur_vin = first_stream_of_type(c->cur, AVMEDIA_TYPE_VIDEO);
     collect_audio_streams(c);
     if ((ret = validate_source_layout(s, path)) < 0) {
         close_current(c);
         return ret;
     }
+    if (is_movie) {
+        int64_t source_start_us = c->cur->start_time == AV_NOPTS_VALUE ? 0
+                                : c->cur->start_time;
+        int64_t relative_us = (int64_t)(seek_s * AV_TIME_BASE);
+
+        /* avformat_seek_file(-1, ...) addresses the nested input's absolute
+         * AV_TIME_BASE timeline. A source with start_time=5 and an operator
+         * seek of 6 therefore targets timestamp 11, not timestamp 6. This is
+         * also required for seek zero: a transport-safe file need not begin on
+         * its first keyframe. Video is stream-copied, so decoder preroll cannot
+         * be hidden from RTP viewers; land on the first independently
+         * decodable keyframe at/after target. */
+        seek_target_us = av_sat_add64(source_start_us, relative_us);
+        ret = seek_to_decodable_keyframe(s, seek_target_us, &seek_target_us);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "playout: seek %s to first keyframe at/after %.1fs failed: %s\n",
+                   path, seek_s, av_err2str(ret));
+            close_current(c);
+            return ret;
+        }
+        landed_relative_us = FFMAX(0, av_sat_sub64(seek_target_us,
+                                                   source_start_us));
+    }
     c->cur_is_movie = is_movie;
     c->offset_us     = c->clip_end_us; /* continue the timeline where it left off */
-    c->clip_start_us = AV_NOPTS_VALUE;
+    c->clip_start_us = seek_target_us;
+    c->seek_target_us = seek_target_us;
     c->audio_cfg_pending = c->nb_cur_ains >= 32 ? UINT32_MAX : ((1U << c->nb_cur_ains) - 1);
 
     if ((ret = setup_video_bsf(s)) < 0) {
@@ -535,6 +633,11 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
         close_current(c);
         return ret;
     }
+
+    if (is_movie)
+        av_log(s, AV_LOG_INFO,
+               "playout: LANDED %"PRId64" %"PRIu64" %"PRId64"\n",
+               c->generation, c->pending_revision, landed_relative_us);
 
     av_log(s, AV_LOG_INFO, "playout: on air: %s%s%s\n",
            is_movie ? "movie " : "slate ", path,
@@ -805,15 +908,30 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
             continue;
         }
 
-        ret = av_read_frame(c->cur, pkt);
+        if (c->pending_pkt) {
+            av_packet_move_ref(pkt, c->pending_pkt);
+            av_packet_free(&c->pending_pkt);
+            ret = 0;
+        } else {
+            ret = av_read_frame(c->cur, pkt);
+        }
         if (ret < 0) {
-            /* Clip over (EOF or read error — either way move on). A movie
-             * that ends falls back to the slate with NO autoplay. */
+            /* Natural EOF advances to the next permitted source. A read error
+             * from a codec-bound movie is propagated below so the supervisor
+             * can checkpoint and recover it instead of declaring completion. */
             if (ret != AVERROR_EOF)
                 av_log(s, AV_LOG_WARNING, "playout: read error mid-clip (%s); advancing\n",
                        av_err2str(ret));
             if (c->cur_is_movie) {
                 c->movie[0] = '\0';
+                /* A codec-bound movie read failure is a recoverable engine
+                 * crash, not natural completion. Propagate the real error so
+                 * the controller checkpoints/restarts instead of marking a
+                 * truncated title finished. */
+                if (ret != AVERROR_EOF && c->movie_eof_stop) {
+                    close_current(c);
+                    return ret;
+                }
                 if (c->movie_eof_stop) {
                     av_log(s, AV_LOG_INFO, "playout: movie ended; stopping codec-bound generation\n");
                     close_current(c);
@@ -880,6 +998,20 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
         int64_t dts_us = pkt->dts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
                        : av_rescale_q(pkt->dts, in_tb, AV_TIME_BASE_Q);
         int64_t dur_us = av_rescale_q(pkt->duration, in_tb, AV_TIME_BASE_Q);
+
+        if (c->seek_target_us != AV_NOPTS_VALUE) {
+            int64_t presentation_us = pts_us != AV_NOPTS_VALUE ? pts_us : dts_us;
+            if (presentation_us == AV_NOPTS_VALUE ||
+                presentation_us < c->seek_target_us) {
+                /* Audio interleaving can place a pre-landing packet after the
+                 * retained video keyframe. An untimestamped packet cannot
+                 * prove that it is on the safe side of the landing fence, so
+                 * fail closed and drop that too. Packet discard flags are
+                 * decoder-local and are not represented in RTP. */
+                av_packet_unref(pkt);
+                continue;
+            }
+        }
 
         if (c->clip_start_us == AV_NOPTS_VALUE)
             c->clip_start_us = dts_us != AV_NOPTS_VALUE ? dts_us

@@ -80,6 +80,83 @@ def create_slate(ffmpeg: str, path: pathlib.Path) -> None:
                    text=True, timeout=20, check=True)
 
 
+def first_frame_hash(command: list[str]) -> str:
+    result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=20, check=True)
+    rows = [line for line in result.stdout.splitlines()
+            if re.match(r"^\d+,", line)]
+    if not rows:
+        fail("framemd5 command produced no decoded frame", result.stderr)
+    return rows[0].rsplit(",", 1)[-1].strip()
+
+
+def test_stream_copy_seek_and_start_time(ffmpeg: str, directory: pathlib.Path,
+                                         slate: pathlib.Path) -> None:
+    source = directory / "seek-source.mp4"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=s=64x64:r=1:d=10",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-bf", "0", "-g", "4", "-keyint_min", "4", "-sc_threshold", "0",
+         str(source)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        timeout=20, check=True,
+    )
+
+    def standard_hash(path: pathlib.Path, seek: float) -> str:
+        return first_frame_hash([
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", str(seek),
+            "-i", str(path), "-frames:v", "1", "-f", "framemd5", "pipe:1",
+        ])
+
+    def playout_stream_copy_hash(path: pathlib.Path, seek: float,
+                                 landed: float, name: str) -> str:
+        # Decode only after the playout packet has crossed a real stream-copy
+        # boundary. AV_PKT_FLAG_DISCARD can hide preroll from a decoder wired
+        # directly to this demuxer, but that flag is absent from RTP/WHEP.
+        copied = directory / f"{name}.mkv"
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "info", "-y",
+             "-f", "playout", "-generation", str(GENERATION),
+             "-initial_movie", str(path), "-initial_seek", str(seek),
+             "-movie_eof_stop", "1", "-loop", "1", "-i", str(slate),
+             "-map", "0:v:0", "-frames:v", "1", "-c:v", "copy",
+             str(copied)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, text=True, timeout=20, check=True,
+        )
+        marker = f"playout: LANDED {GENERATION} 0 {int(landed * 1_000_000)}"
+        if marker not in result.stderr:
+            fail(f"playout did not report exact seek landing {marker!r}",
+                 result.stderr)
+        return first_frame_hash([
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(copied),
+            "-frames:v", "1", "-f", "framemd5", "pipe:1",
+        ])
+
+    expected = standard_hash(source, 4)
+    actual = playout_stream_copy_hash(source, 2, 4, "seek-copy")
+    if actual != expected:
+        fail("stream-copied playout did not begin on the first keyframe at-or-after seek "
+             f"(got {actual}, want {expected})")
+
+    offset_source = directory / "seek-source-start-5.mp4"
+    subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+         "-map", "0:v:0", "-c", "copy", "-output_ts_offset", "5",
+         str(offset_source)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        timeout=20, check=True,
+    )
+    expected = standard_hash(source, 8)
+    actual = playout_stream_copy_hash(offset_source, 6, 8,
+                                      "seek-start-time-copy")
+    if actual != expected:
+        fail("stream-copied playout seek ignored the nested source start_time "
+             f"(got {actual}, want {expected})")
+
+
 def run_codec_bound_failure(ffmpeg: str, slate: pathlib.Path,
                             movie: pathlib.Path, seek: float) -> str:
     command = [
@@ -527,6 +604,7 @@ def main() -> int:
         slate = directory / "slate.mkv"
         test_publish_hold(ffmpeg, directory, slate)
         test_codec_bound_fail_closed(ffmpeg, directory, slate)
+        test_stream_copy_seek_and_start_time(ffmpeg, directory, slate)
     print("playout control FIFO tests passed")
     return 0
 
