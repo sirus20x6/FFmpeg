@@ -80,6 +80,62 @@ def create_slate(ffmpeg: str, path: pathlib.Path) -> None:
                    text=True, timeout=20, check=True)
 
 
+def test_event_channel(ffmpeg: str, slate: pathlib.Path) -> None:
+    """The controller protocol is the inherited pipe, never FFmpeg logs."""
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(write_fd, True)
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-f",
+        "playout",
+        "-generation",
+        str(GENERATION),
+        "-event_fd",
+        str(write_fd),
+        "-loop",
+        "1",
+        "-i",
+        str(slate),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-f",
+        "null",
+        "-",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        pass_fds=(write_fd,),
+    )
+    os.close(write_fd)
+    try:
+        with os.fdopen(read_fd, "rb", closefd=True) as events:
+            event_data = events.read()
+        _, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+    if process.returncode != 0:
+        fail("playout event-channel fixture failed",
+             stderr.decode("utf-8", "replace"))
+    lines = event_data.decode("ascii").splitlines()
+    expected = {
+        f"MEMEPIPE/1\tON_AIR_SLATE\t{GENERATION}\t0",
+        f"MEMEPIPE/1\tPLAYOUT_READY\t{GENERATION}",
+    }
+    if not expected.issubset(set(lines)):
+        fail(f"playout event channel missing {sorted(expected - set(lines))}",
+             "\n".join(lines))
+
+
 def first_frame_hash(command: list[str]) -> str:
     result = subprocess.run(command, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -605,6 +661,7 @@ def main() -> int:
         test_publish_hold(ffmpeg, directory, slate)
         test_codec_bound_fail_closed(ffmpeg, directory, slate)
         test_stream_copy_seek_and_start_time(ffmpeg, directory, slate)
+        test_event_channel(ffmpeg, slate)
     print("playout control FIFO tests passed")
     return 0
 

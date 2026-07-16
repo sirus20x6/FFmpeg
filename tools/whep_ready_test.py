@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Regression coverage for the WHEP transport admission marker.
+"""Regression coverage for WHEP transport admission.
 
-The controller treats ``whep: READY <transport_generation>`` as a commit
-boundary, so a false-positive marker can expose a process that cannot serve
-viewers.  These tests exercise the real ffmpeg binary and prove that the
-marker is emitted exactly once, only after listen(2) succeeds and every codec
-and RTP-muxer initialization step has completed.
+The controller consumes a private ``MEMEPIPE/1 WHEP_READY`` event; the
+``whep: READY`` log is diagnostics only. These tests exercise the real ffmpeg
+binary and prove admission is emitted exactly once, only after listen(2)
+succeeds and every codec and RTP-muxer initialization step has completed.
 """
 
 import argparse
@@ -125,7 +124,7 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 class Capture:
     """Unbuffered stderr capture that can observe a deliberately gated child."""
 
-    def __init__(self, command, env=None):
+    def __init__(self, command, env=None, pass_fds=()):
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -133,6 +132,7 @@ class Capture:
             stderr=subprocess.PIPE,
             env=env,
             bufsize=0,
+            pass_fds=pass_fds,
         )
         self.data = bytearray()
 
@@ -209,7 +209,7 @@ def build_injector(cc, directory):
     return library
 
 
-def ffmpeg_command(ffmpeg, port, *, b_frames=False):
+def ffmpeg_command(ffmpeg, port, *, b_frames=False, event_fd=None):
     command = [
         ffmpeg,
         "-hide_banner",
@@ -240,8 +240,10 @@ def ffmpeg_command(ffmpeg, port, *, b_frames=False):
         "127.0.0.1",
         "-transport_generation",
         str(TRANSPORT_GENERATION),
-        f"http://127.0.0.1:{port}/",
     ]
+    if event_fd is not None:
+        command += ["-event_fd", str(event_fd)]
+    command += [f"http://127.0.0.1:{port}/"]
     return command
 
 
@@ -311,6 +313,32 @@ def test_success_after_listener(ffmpeg, library, directory):
     )
 
 
+def test_authoritative_event_channel(ffmpeg):
+    port = unused_port()
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(write_fd, True)
+    capture = Capture(
+        ffmpeg_command(ffmpeg, port, event_fd=write_fd),
+        pass_fds=(write_fd,),
+    )
+    os.close(write_fd)
+    try:
+        capture.wait_ready()
+        readable, _, _ = select.select([read_fd], [], [], 2.0)
+        assert readable, "timed out waiting for authoritative WHEP event"
+        event = os.read(read_fd, 4096)
+    finally:
+        os.close(read_fd)
+        capture.finish(terminate=True)
+    expected = (
+        f"MEMEPIPE/1\tWHEP_READY\t{TRANSPORT_GENERATION}\n".encode()
+    )
+    assert event == expected, (
+        f"unexpected authoritative WHEP event {event!r}, want {expected!r}\n"
+        f"{capture.text()}"
+    )
+
+
 def test_bind_failure(ffmpeg):
     blocker = socket.socket()
     blocker.bind(("127.0.0.1", 0))
@@ -377,6 +405,7 @@ def main():
         directory = Path(temp)
         library = build_injector(args.cc, directory)
         test_success_after_listener(args.ffmpeg, library, directory)
+        test_authoritative_event_channel(args.ffmpeg)
         test_bind_failure(args.ffmpeg)
         test_codec_failure(args.ffmpeg)
         if not args.skip_rtp_allocation_fault:

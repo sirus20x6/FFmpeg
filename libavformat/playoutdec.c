@@ -57,6 +57,7 @@
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
+#include "memepipe_event.h"
 #include "url.h"
 
 #define MAX_SLATES        64
@@ -79,6 +80,7 @@ typedef struct PlayoutContext {
     /* options */
     char *control_path;   /* FIFO to read live commands from (NULL = none) */
     int64_t generation;   /* boot-unique controller generation */
+    int event_fd;         /* inherited authoritative controller-event pipe */
     int   loop;           /* slate sequence repeats; -1 = forever */
     char *initial_movie;  /* optional codec-seeding movie for this generation */
     double initial_seek;  /* starting position for initial_movie */
@@ -128,6 +130,7 @@ typedef struct PlayoutContext {
     uint64_t pending_seq;
     uint64_t pending_revision;
     char pending_kind[16];
+    int event_error;      /* first failed authoritative event write */
 } PlayoutContext;
 
 /* ---- control ----------------------------------------------------------- */
@@ -135,6 +138,7 @@ typedef struct PlayoutContext {
 static void command_result(AVFormatContext *s, int ok, const char *reason)
 {
     PlayoutContext *c = s->priv_data;
+    int ret;
     if (!c->pending_seq)
         return;
 
@@ -143,6 +147,14 @@ static void command_result(AVFormatContext *s, int ok, const char *reason)
            ok ? "ACK" : "ERR", c->pending_seq, c->generation,
            c->pending_revision, c->pending_kind,
            reason ? " " : "", reason ? reason : "");
+    ret = ff_memepipe_event_emit(c->event_fd, "COMMAND_RESULT",
+                                 "%"PRId64"\t%s\t%"PRIu64"\t%"PRId64"\t%"PRIu64"\t%s\t%s",
+                                 c->generation, ok ? "ACK" : "ERR",
+                                 c->pending_seq, c->generation,
+                                 c->pending_revision, c->pending_kind,
+                                 reason ? reason : "-");
+    if (ret < 0 && !c->event_error)
+        c->event_error = ret;
     c->pending_seq = 0;
     c->pending_revision = 0;
     c->pending_kind[0] = 0;
@@ -250,12 +262,20 @@ static void handle_command(AVFormatContext *s, const char *line)
         av_log(s, AV_LOG_ERROR,
                "playout: ERR %"PRIu64" %"PRId64" %"PRIu64" %s stale_generation\n",
                seq, gen, rev, cmd);
+        if (!c->event_error)
+            c->event_error = ff_memepipe_event_emit(c->event_fd, "COMMAND_RESULT",
+                                                    "%"PRId64"\tERR\t%"PRIu64"\t%"PRId64"\t%"PRIu64"\t%s\tstale_generation",
+                                                    c->generation, seq, gen, rev, cmd);
         return;
     }
     if (rev <= c->last_revision) {
         av_log(s, AV_LOG_ERROR,
                "playout: ERR %"PRIu64" %"PRId64" %"PRIu64" %s stale_revision\n",
                seq, gen, rev, cmd);
+        if (!c->event_error)
+            c->event_error = ff_memepipe_event_emit(c->event_fd, "COMMAND_RESULT",
+                                                    "%"PRId64"\tERR\t%"PRIu64"\t%"PRId64"\t%"PRIu64"\t%s\tstale_revision",
+                                                    c->generation, seq, gen, rev, cmd);
         return;
     }
     if (c->pending_seq)
@@ -634,10 +654,17 @@ static int open_source(AVFormatContext *s, const char *path, double seek_s, int 
         return ret;
     }
 
-    if (is_movie)
+    if (is_movie) {
         av_log(s, AV_LOG_INFO,
                "playout: LANDED %"PRId64" %"PRIu64" %"PRId64"\n",
                c->generation, c->pending_revision, landed_relative_us);
+        ret = ff_memepipe_event_emit(c->event_fd, "LANDED",
+                                     "%"PRId64"\t%"PRIu64"\t%"PRId64,
+                                     c->generation, c->pending_revision,
+                                     landed_relative_us);
+        if (ret < 0)
+            return ret;
+    }
 
     av_log(s, AV_LOG_INFO, "playout: on air: %s%s%s\n",
            is_movie ? "movie " : "slate ", path,
@@ -693,6 +720,13 @@ static int open_next(AVFormatContext *s)
                 return AVERROR_EOF;
         }
         if (open_source(s, c->slates[c->slate_idx], 0, 0) >= 0) {
+            ret = ff_memepipe_event_emit(c->event_fd, "ON_AIR_SLATE",
+                                         "%"PRId64"\t%d",
+                                         c->generation, c->slate_idx);
+            if (ret < 0) {
+                close_current(c);
+                return ret;
+            }
             c->slate_idx++;
             c->open_failures = 0;
             command_result(s, 1, NULL);
@@ -715,6 +749,13 @@ static int playout_read_header(AVFormatContext *s)
     c->nb_cur_ains = 0;
     c->clip_start_us = AV_NOPTS_VALUE;
     c->published = !c->hold_until_publish;
+
+    if (c->event_fd >= 0 &&
+        (ret = ff_memepipe_event_validate_fd(c->event_fd)) < 0) {
+        av_log(s, AV_LOG_ERROR, "playout: invalid event fd %d: %s\n",
+               c->event_fd, av_err2str(ret));
+        return ret;
+    }
 
     if (c->hold_until_publish &&
         (!c->control_path || !*c->control_path ||
@@ -874,6 +915,9 @@ static int playout_read_header(AVFormatContext *s)
     s->duration = 0;
     /* Controller readiness is only truthful after every public stream and
      * codec parameter has been installed successfully. */
+    if ((ret = ff_memepipe_event_emit(c->event_fd, "PLAYOUT_READY",
+                                      "%"PRId64, c->generation)) < 0)
+        return ret;
     av_log(s, AV_LOG_INFO, "playout: READY %"PRId64"\n", c->generation);
     if (c->hold_until_publish)
         av_log(s, AV_LOG_INFO, "playout: HOLD %"PRId64" awaiting publish\n",
@@ -888,6 +932,8 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     for (;;) {
         poll_control(s);
+        if (c->event_error)
+            return c->event_error;
         if (c->stop_requested)
             return AVERROR_EOF;
         if (ff_check_interrupt(&s->interrupt_callback))
@@ -934,10 +980,20 @@ static int playout_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
                 if (c->movie_eof_stop) {
                     av_log(s, AV_LOG_INFO, "playout: movie ended; stopping codec-bound generation\n");
+                    ret = ff_memepipe_event_emit(c->event_fd, "MOVIE_END",
+                                                 "%"PRId64"\tSTOP", c->generation);
                     close_current(c);
+                    if (ret < 0)
+                        return ret;
                     return AVERROR_EOF;
                 }
                 av_log(s, AV_LOG_INFO, "playout: movie ended; back to slate\n");
+                ret = ff_memepipe_event_emit(c->event_fd, "MOVIE_END",
+                                             "%"PRId64"\tSLATE", c->generation);
+                if (ret < 0) {
+                    close_current(c);
+                    return ret;
+                }
             }
             close_current(c);
             continue;
@@ -1055,6 +1111,8 @@ static const AVOption playout_options[] = {
       OFFSET(control_path), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
     { "generation", "controller generation used to fence stale commands",
       OFFSET(generation), AV_OPT_TYPE_INT64, { .i64 = 1 }, 1, INT64_MAX, DEC },
+    { "event_fd", "inherited descriptor for authoritative controller events",
+      OFFSET(event_fd), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC },
     { "loop", "times to play the slate sequence (-1 = forever)",
       OFFSET(loop), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC },
     { "initial_movie", "start this generation directly on a movie",

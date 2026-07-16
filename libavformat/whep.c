@@ -41,6 +41,7 @@
 #include "avio_internal.h"
 #include "http.h"
 #include "internal.h"
+#include "memepipe_event.h"
 #include "mux.h"
 #include "network.h"
 #include "rtp.h"
@@ -377,6 +378,7 @@ typedef struct WHIPContext {
      * the response header to the control-plane transport generation so a POST
      * racing a process replacement can never expose the wrong MediaStream. */
     int64_t transport_generation;
+    int event_fd;
     AV1SequenceParameters video_av1;
     uint64_t sessions_created;
     uint64_t capacity_rejects;
@@ -4122,6 +4124,12 @@ static av_cold int whip_init(AVFormatContext *s)
 {
     WHIPContext *whip = s->priv_data;
     int ret;
+    if (whip->event_fd >= 0 &&
+        (ret = ff_memepipe_event_validate_fd(whip->event_fd)) < 0) {
+        av_log(s, AV_LOG_ERROR, "whep: invalid event fd %d: %s\n",
+               whip->event_fd, av_err2str(ret));
+        goto end;
+    }
     if ((ret = initialize(s)) < 0)
         goto end;
     if ((ret = whep_open_listener(s)) < 0)
@@ -4131,11 +4139,14 @@ static av_cold int whip_init(AVFormatContext *s)
     if ((ret = create_rtp_muxer(s)) < 0)
         goto end;
 
-    /* This is the transport admission marker consumed by the controller.  It
-     * must remain after every fallible listener/codec/RTP initialization step:
-     * a playout input can be ready while its output transport is still unable
-     * to bind or packetize.  Keep the format strict and free of credentials so
-     * an exact generation match is safe to parse from private process logs. */
+    /* The event-pipe record is the authoritative transport admission event.
+     * Keep it after every fallible listener/codec/RTP initialization step: a
+     * playout input can be ready while its output transport still cannot bind
+     * or packetize.  The log line remains diagnostics only. */
+    if ((ret = ff_memepipe_event_emit(whip->event_fd, "WHEP_READY",
+                                      "%"PRId64,
+                                      whip->transport_generation)) < 0)
+        goto end;
     av_log(s, AV_LOG_INFO, "whep: READY %"PRId64"\n",
            whip->transport_generation);
 
@@ -4875,6 +4886,7 @@ static const AVOption options[] = {
     { "udp_port_max",       "Highest UDP port for viewer sessions (with udp_port_min: sessions bind within [min,max], firewall/NAT-mappable)", OFFSET(udp_port_max), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 65535, ENC },
     { "max_sessions",       "Maximum concurrent WHEP viewer sessions", OFFSET(max_sessions), AV_OPT_TYPE_INT, { .i64 = WHEP_DEFAULT_MAX_SESSIONS }, 1, 1024, ENC },
     { "transport_generation", "Immutable process generation returned with every WHEP answer", OFFSET(transport_generation), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, INT64_MAX, ENC },
+    { "event_fd",             "Inherited descriptor for authoritative controller events", OFFSET(event_fd), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, ENC },
     { NULL },
 };
 
