@@ -19,6 +19,7 @@
 #ifndef AVCODEC_HWACCELS_H
 #define AVCODEC_HWACCELS_H
 
+extern const struct FFHWAccel ff_apv_vulkan_hwaccel;
 extern const struct FFHWAccel ff_av1_d3d11va_hwaccel;
 extern const struct FFHWAccel ff_av1_d3d11va2_hwaccel;
 extern const struct FFHWAccel ff_av1_d3d12va_hwaccel;
@@ -28,6 +29,7 @@ extern const struct FFHWAccel ff_av1_vaapi_hwaccel;
 extern const struct FFHWAccel ff_av1_vdpau_hwaccel;
 extern const struct FFHWAccel ff_av1_videotoolbox_hwaccel;
 extern const struct FFHWAccel ff_av1_vulkan_hwaccel;
+extern const struct FFHWAccel ff_dpx_vulkan_hwaccel;
 extern const struct FFHWAccel ff_ffv1_vulkan_hwaccel;
 extern const struct FFHWAccel ff_h263_vaapi_hwaccel;
 extern const struct FFHWAccel ff_h263_videotoolbox_hwaccel;
@@ -68,6 +70,7 @@ extern const struct FFHWAccel ff_mpeg4_vdpau_hwaccel;
 extern const struct FFHWAccel ff_mpeg4_videotoolbox_hwaccel;
 extern const struct FFHWAccel ff_prores_videotoolbox_hwaccel;
 extern const struct FFHWAccel ff_prores_vulkan_hwaccel;
+extern const struct FFHWAccel ff_prores_raw_videotoolbox_hwaccel;
 extern const struct FFHWAccel ff_prores_raw_vulkan_hwaccel;
 extern const struct FFHWAccel ff_vc1_d3d11va_hwaccel;
 extern const struct FFHWAccel ff_vc1_d3d11va2_hwaccel;

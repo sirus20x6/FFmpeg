@@ -1,0 +1,85 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WHEP test — memepipe fork</title>
+<!--
+  Minimal WHEP (WebRTC-HTTP Egress Protocol) client for testing the fork's
+  `whep` muxer. Serve/open this page, point the URL at the whep endpoint, hit
+  Play. The browser creates a recvonly offer, POSTs it (Content-Type:
+  application/sdp) to the whep endpoint, sets the returned SDP answer, and
+  attaches the incoming track to the <video>.
+
+  Feed the muxer, e.g.:
+    ffmpeg -re -i input.mp4 -c:v libx264 -c:a libopus -f whep http://0.0.0.0:8000/
+    (or:  mpplayout --live http://... | ... -f whep http://0.0.0.0:8000/  once wired)
+
+  Notes:
+   - muted+autoplay so browsers allow playback without a user gesture.
+   - Waits for ICE gathering to finish (non-trickle) before POSTing, since the
+     fork's whep is ice-lite/one-candidate.
+-->
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 2rem; background:#111; color:#eee; }
+  video { width:100%; max-width:960px; background:#000; border-radius:8px; }
+  input { font: inherit; padding:.4rem; width:28rem; max-width:70vw; }
+  button { font: inherit; padding:.4rem 1rem; cursor:pointer; }
+  #status { margin-left:1rem; color:#8f8; }
+  .err { color:#f88 !important; }
+</style>
+
+<h2>WHEP test — memepipe ffmpeg fork</h2>
+<video id="v" autoplay playsinline controls muted></video>
+<p>
+  <input id="url">
+  <script>document.getElementById('url').value = 'http://' + location.hostname + ':7891/';</script>
+  <button onclick="play()">Play</button>
+  <button onclick="stop()">Stop</button>
+  <span id="status">idle</span>
+</p>
+
+<script>
+let pc = null;
+const $ = id => document.getElementById(id);
+function set(msg, err) { const s = $('status'); s.textContent = msg; s.className = err ? 'err' : ''; }
+
+async function play() {
+  await stop();
+  set('connecting…');
+  pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  pc.ontrack = e => { $('v').srcObject = e.streams[0]; };
+  pc.oniceconnectionstatechange = () => set('ICE: ' + pc.iceConnectionState,
+                                            /failed|disconnected/.test(pc.iceConnectionState));
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // Non-trickle: wait for ICE gathering to complete (cap at 800ms).
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const done = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', done); res(); } };
+    pc.addEventListener('icegatheringstatechange', done);
+    setTimeout(res, 800);
+  });
+
+  try {
+    const resp = await fetch($('url').value, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp' },
+      body: pc.localDescription.sdp,
+    });
+    if (!resp.ok) { set('HTTP ' + resp.status + ' ' + resp.statusText, true); return; }
+    const answer = await resp.text();
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+    set('answer set — negotiating…');
+  } catch (e) {
+    set('error: ' + e.message, true);
+  }
+}
+
+async function stop() {
+  if (pc) { pc.close(); pc = null; }
+  $('v').srcObject = null;
+  set('idle');
+}
+</script>

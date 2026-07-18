@@ -714,7 +714,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
 
     if (INT_MAX / 8 < size) {
         av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid fragment: "
-               "too large (%"SIZE_SPECIFIER" bytes).\n", size);
+               "too large (%zu bytes).\n", size);
         err = AVERROR_INVALIDDATA;
         goto fail;
     }
@@ -765,7 +765,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
         if (obu_header.obu_has_size_field) {
             if (get_bits_left(&gbc) < 8) {
                 av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU: fragment "
-                       "too short (%"SIZE_SPECIFIER" bytes).\n", size);
+                       "too short (%zu bytes).\n", size);
                 err = AVERROR_INVALIDDATA;
                 goto fail;
             }
@@ -782,7 +782,7 @@ static int cbs_av1_split_fragment(CodedBitstreamContext *ctx,
 
         if (size < obu_length) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU length: "
-                   "%"PRIu64", but only %"SIZE_SPECIFIER" bytes remaining in fragment.\n",
+                   "%"PRIu64", but only %zu bytes remaining in fragment.\n",
                    obu_length, size);
             err = AVERROR_INVALIDDATA;
             goto fail;
@@ -868,7 +868,7 @@ static int cbs_av1_read_unit(CodedBitstreamContext *ctx,
     } else {
         if (unit->data_size < 1 + obu->header.obu_extension_flag) {
             av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU length: "
-                   "unit too short (%"SIZE_SPECIFIER").\n", unit->data_size);
+                   "unit too short (%zu).\n", unit->data_size);
             return AVERROR_INVALIDDATA;
         }
         obu->obu_size = unit->data_size - 1 - obu->header.obu_extension_flag;
@@ -938,11 +938,15 @@ static int cbs_av1_read_unit(CodedBitstreamContext *ctx,
                                          unit->data_ref);
             if (err < 0)
                 return err;
-    // fall-through
+            av_fallthrough;
     case AV1_OBU_TILE_GROUP:
         {
             AV1RawTileGroup *tile_group = obu->header.obu_type == AV1_OBU_FRAME ? &obu->obu.frame.tile_group
                                                                                 : &obu->obu.tile_group;
+
+            if (!priv->seen_frame_header)
+                return AVERROR_INVALIDDATA;
+
             err = cbs_av1_ref_tile_data(ctx, unit, &gbc,
                                         &tile_group->data_ref,
                                         &tile_group->data,
@@ -1116,7 +1120,7 @@ static int cbs_av1_write_obu(CodedBitstreamContext *ctx,
             err = cbs_av1_write_frame_obu(ctx, pbc, &obu->obu.frame, NULL);
             if (err < 0)
                 goto error;
-    // fall-through
+            av_fallthrough;
     case AV1_OBU_TILE_GROUP:
         {
             AV1RawTileGroup *tile_group = obu->header.obu_type == AV1_OBU_FRAME ? &obu->obu.frame.tile_group

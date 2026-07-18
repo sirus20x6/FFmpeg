@@ -41,6 +41,10 @@ struct RTPMuxContext {
     /* rtcp sender statistics */
     int64_t last_rtcp_ntp_time;
     int64_t first_rtcp_ntp_time;
+    /* PKT_TS_SR: RTP value of the stream position airing "now" — the
+     * outgoing packet's DTS, since realtime pacing runs on DTS. */
+    uint32_t sr_pkt_ts;
+    int sr_fast_count;
     unsigned int packet_count;
     unsigned int octet_count;
     unsigned int last_octet_count;
@@ -70,6 +74,8 @@ typedef struct RTPMuxContext RTPMuxContext;
 #define FF_RTP_FLAG_SKIP_RTCP 4
 #define FF_RTP_FLAG_H264_MODE0 8
 #define FF_RTP_FLAG_SEND_BYE  16
+#define FF_RTP_FLAG_HEVC_NO_AP 32
+#define FF_RTP_FLAG_PKT_TS_SR 64
 
 #define FF_RTP_FLAG_OPTS(ctx, fieldname) \
     { "rtpflags", "RTP muxer flags", offsetof(ctx, fieldname), AV_OPT_TYPE_FLAGS, {.i64 = 0}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
@@ -77,7 +83,9 @@ typedef struct RTPMuxContext RTPMuxContext;
     { "rfc2190", "Use RFC 2190 packetization instead of RFC 4629 for H.263", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_RFC2190}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
     { "skip_rtcp", "Don't send RTCP sender reports", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_SKIP_RTCP}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
     { "h264_mode0", "Use mode 0 for H.264 in RTP", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_H264_MODE0}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
-    { "send_bye", "Send RTCP BYE packets when finishing", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_SEND_BYE}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" } \
+    { "send_bye", "Send RTCP BYE packets when finishing", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_SEND_BYE}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
+    { "hevc_no_ap", "Send HEVC as single NAL/FU packets without aggregation packets", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_HEVC_NO_AP}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" }, \
+    { "pkt_ts_sr", "Pair the outgoing packet's RTP timestamp with wall-clock NTP in sender reports (for realtime-paced senders)", 0, AV_OPT_TYPE_CONST, {.i64 = FF_RTP_FLAG_PKT_TS_SR}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "rtpflags" } \
 
 void ff_rtp_send_data(AVFormatContext *s1, const uint8_t *buf1, int len, int m);
 
@@ -93,7 +101,8 @@ void ff_rtp_send_mpegvideo(AVFormatContext *s1, const uint8_t *buf1, int size);
 void ff_rtp_send_xiph(AVFormatContext *s1, const uint8_t *buff, int size);
 void ff_rtp_send_vc2hq(AVFormatContext *s1, const uint8_t *buf, int size, int interlaced);
 void ff_rtp_send_vp8(AVFormatContext *s1, const uint8_t *buff, int size);
-void ff_rtp_send_vp9(AVFormatContext *s1, const uint8_t *buff, int size);
+void ff_rtp_send_vp9(AVFormatContext *s1, const uint8_t *buff, int size,
+                     int is_keyframe);
 void ff_rtp_send_av1(AVFormatContext *s1, const uint8_t *buf1, int size, int is_keyframe);
 void ff_rtp_send_jpeg(AVFormatContext *s1, const uint8_t *buff, int size);
 void ff_rtp_send_raw_rfc4175(AVFormatContext *s1, const uint8_t *buf, int size, int interlaced, int field);

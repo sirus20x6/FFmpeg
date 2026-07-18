@@ -32,8 +32,11 @@
 # - Optionally align operand columns vertically according to their
 #   maximum width (accommodating for e.g. x0 vs x10, or v0.8b vs v16.16b).
 #
-# The input code is passed to stdin, and the reformatted code is written
-# on stdout.
+# The script can be executed as "indent_arm_assembly.pl file [outfile]".
+# If no outfile is specified, the given file is overwritten in place.
+#
+# Alternatively, the if no file parameters are given, the script reads input
+# code on stdin, and outputs the reformatted code on stdout.
 
 use strict;
 
@@ -41,6 +44,8 @@ my $indent_operands = 0;
 my $instr_indent = 8;
 my $operand_indent = 24;
 my $match_indent = 0;
+my $file;
+my $outfile;
 
 while (@ARGV) {
     my $opt = shift;
@@ -54,7 +59,13 @@ while (@ARGV) {
     } elsif ($opt eq "-match-indent") {
         $match_indent = 1;
     } else {
-        die "Unrecognized parameter $opt\n";
+        if (!$file) {
+            $file = $opt;
+        } elsif (!$outfile) {
+            $outfile = $opt;
+        } else {
+            die "Unrecognized parameter $opt\n";
+        }
     }
 }
 
@@ -130,7 +141,26 @@ sub columns {
     return indentcolumns($rest, 3);
 }
 
-while (<STDIN>) {
+my $in;
+my $out;
+my $tempfile;
+
+if ($file) {
+    open(INPUT, "$file") or die "Unable to open $file: $!";
+    $in = *INPUT;
+    if ($outfile) {
+        open(OUTPUT, ">$outfile") or die "Unable to open $outfile: $!";
+    } else {
+        $tempfile = "$file.tmp";
+        open(OUTPUT, ">$tempfile") or die "Unable to open $tempfile: $!";
+    }
+    $out = *OUTPUT;
+} else {
+    $in = *STDIN;
+    $out = *STDOUT;
+}
+
+while (<$in>) {
     # Trim off trailing whitespace.
     chomp;
     if (/^([\.\w\d]+:)?(\s+)([\w\\][\w\\\.]*)(?:(\s+)(.*)|$)/) {
@@ -142,6 +172,7 @@ while (<STDIN>) {
 
         my $orig_operand_indent = length($label) + length($indent) +
                                   length($instr) + length($origspace);
+        my $orig_indent = $indent;
 
         if ($indent_operands) {
             $rest = columns($rest);
@@ -185,14 +216,35 @@ while (<STDIN>) {
             $size -= $instr_end;
         }
         my $operand_space = " ";
-        if ($size > 0) {
-            $operand_space = spaces($size);
+        if ($rest =~ /^\.req/i) {
+            # A line like "alias .req reg" shouldn't necessarily be
+            # reindented like "     alias          .req reg"; keep the original
+            # indentation instead.
+            $indent = $orig_indent;
+            $operand_space = $origspace;
+        } else {
+            if ($size > 0) {
+                $operand_space = spaces($size);
+            }
         }
+
+        # Lowercase register names. Only apply this on lines up to
+        # comments, as this can match common spec/code references in
+        # code comments. Split the string on //, /* or @ for comments, apply the
+        # substitution on the first segment (up to a comment char), and
+        # join the string again.
+        my @parts = split(/(\/\/|\/\*|@)/, $rest);
+        $parts[0] =~ s/\b([XWVQDSHBZP][0-9]+)\b/lc($1)/ge;
+        $rest = join('', @parts);
 
         # Lowercase the aarch64 vector layout description, .8B -> .8b
         $rest =~ s/(\.[84216]*[BHSD])/lc($1)/ge;
         # Lowercase modifiers like "uxtw" or "lsl"
         $rest =~ s/([SU]XT[BWH]|[LA]S[LR])/lc($1)/ge;
+        # Lowercase SVE/SME modifiers like "/Z" or "/M"
+        $rest =~ s,(/[ZM])\b,lc($1),ge;
+        # Lowercase SVE/SME vector lengths
+        $rest =~ s/\b(VL[0-9]+)\b/lc($1)/ge;
 
         # Reassemble the line
         if ($rest eq "") {
@@ -201,5 +253,13 @@ while (<STDIN>) {
             $_ = $label . $indent . $instr . $operand_space . $rest;
         }
     }
-    print $_ . "\n";
+    print $out $_ . "\n";
+}
+
+if ($file) {
+    close(INPUT);
+    close(OUTPUT);
+}
+if ($tempfile) {
+    rename($tempfile, $file);
 }

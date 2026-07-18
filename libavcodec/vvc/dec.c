@@ -86,6 +86,8 @@ static int tl_create(TabList *l)
 
         for (int i = 0; i < l->nb_tabs; i++) {
             Tab *t = l->tabs + i;
+            if (!t->size)
+                continue;
             *t->tab = l->zero ? av_mallocz(t->size) : av_malloc(t->size);
             if (!*t->tab)
                 return AVERROR(ENOMEM);
@@ -245,17 +247,15 @@ static void pixel_buffer_nz_tl_init(TabList *l, VVCFrameContext *fc)
 
     tl_init(l, 0, changed);
 
-    for (int c_idx = 0; c_idx < c_end; c_idx++) {
-        const int w = width  >> (sps ? sps->hshift[c_idx] : 0);
-        const int h = height >> (sps ? sps->vshift[c_idx] : 0);
+    /* Add size 0 tabs for the components beyond c_end, so tl_free() frees
+     * tabs allocated under a previous, larger chroma format. */
+    for (int c_idx = 0; c_idx < VVC_MAX_SAMPLE_ARRAYS; c_idx++) {
+        const int active = c_idx < c_end;
+        const int w = active ? width  >> (sps ? sps->hshift[c_idx] : 0) : 0;
+        const int h = active ? height >> (sps ? sps->vshift[c_idx] : 0) : 0;
+        const int border_pixels = c_idx ? ALF_BORDER_CHROMA : ALF_BORDER_LUMA;
         TL_ADD(sao_pixel_buffer_h[c_idx], (w * 2 * ctu_height) << ps);
         TL_ADD(sao_pixel_buffer_v[c_idx], (h * 2 * ctu_width)  << ps);
-    }
-
-    for (int c_idx = 0; c_idx < c_end; c_idx++) {
-        const int w = width  >> (sps ? sps->hshift[c_idx] : 0);
-        const int h = height >> (sps ? sps->vshift[c_idx] : 0);
-        const int border_pixels = c_idx ? ALF_BORDER_CHROMA : ALF_BORDER_LUMA;
         for (int i = 0; i < 2; i++) {
             TL_ADD(alf_pixel_buffer_h[c_idx][i], (w * border_pixels * ctu_height) << ps);
             TL_ADD(alf_pixel_buffer_v[c_idx][i], h * ALF_PADDING_SIZE * ctu_width);
@@ -726,7 +726,6 @@ static int frame_context_setup(VVCFrameContext *fc, VVCContext *s)
     }
 
     if (IS_IDR(s)) {
-        s->seq_decode = (s->seq_decode + 1) & 0xff;
         ff_vvc_clear_refs(fc);
     }
 
@@ -768,7 +767,7 @@ static int check_film_grain(VVCContext *s, VVCFrameContext *fc)
 
     fc->ref->needs_fg = (fc->sei.common.film_grain_characteristics &&
         fc->sei.common.film_grain_characteristics->present ||
-        fc->sei.common.aom_film_grain.enable) &&
+        fc->sei.common.itut_t35.aom_film_grain.enable) &&
         !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) &&
         !s->avctx->hwaccel;
 
@@ -808,10 +807,10 @@ static int frame_start(VVCContext *s, VVCFrameContext *fc, SliceContext *sc)
     if (!s->temporal_id && !ph->r->ph_non_ref_pic_flag && !(IS_RASL(s) || IS_RADL(s)))
         s->poc_tid0 = ph->poc;
 
+    decode_prefix_sei(fc, s);
+
     if ((ret = ff_vvc_set_new_ref(s, fc, &fc->frame)) < 0)
         goto fail;
-
-    decode_prefix_sei(fc, s);
 
     ret = set_side_data(s, fc);
     if (ret < 0)
@@ -1226,6 +1225,7 @@ static av_cold void vvc_decode_flush(AVCodecContext *avctx)
 
     if (s->fcs) {
         VVCFrameContext *last = get_frame_context(s, s->fcs, s->nb_frames - 1);
+        ff_vvc_sei_reset(&last->sei);
         ff_vvc_flush_dpb(last);
     }
 

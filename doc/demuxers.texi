@@ -281,7 +281,11 @@ This demuxer accepts the following option:
 @table @option
 
 @item cenc_decryption_key
-16-byte key, in hex, to decrypt files encrypted using ISO Common Encryption (CENC/AES-128 CTR; ISO/IEC 23001-7).
+Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encryption (CENC/AES-128 CTR; ISO/IEC 23001-7).
+
+@item cenc_decryption_keys
+Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
+(CENC/AES-128 CTR; ISO/IEC 23001-7).
 
 @end table
 
@@ -940,7 +944,11 @@ Fixed key used for handling Audible AAX/AAX+ files. It has been pre-set so shoul
 specify.
 
 @item decryption_key
-16-byte key, in hex, to decrypt files encrypted using ISO Common Encryption (CENC/AES-128 CTR; ISO/IEC 23001-7).
+Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encryption (CENC/AES-128 CTR; ISO/IEC 23001-7).
+
+@item decryption_keys
+Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
+(CENC/AES-128 CTR; ISO/IEC 23001-7).
 
 @item max_stts_delta
 Very high sample deltas written in a trak's stts box may occasionally be intended but usually they are written in
@@ -1035,6 +1043,11 @@ Set input video frame rate. Default value is 25.
 @item pixel_format
 Set the input video pixel format. Default value is @code{yuv420p}.
 
+@item stride
+Set frame line size in bytes, only required if there are extra padding.
+For multiplane formats, @option{stride} is a list of line size for each
+plane.
+
 @item video_size
 Set the input video size. This value must be specified explicitly.
 @end table
@@ -1045,6 +1058,13 @@ size of @code{320x240}, and a frame rate of 10 images per second, use
 the command:
 @example
 ffplay -f rawvideo -pixel_format rgb24 -video_size 320x240 -framerate 10 input.raw
+@end example
+
+Read a rawvideo with @command{ffplay}, assuming a pixel format of @code{yuv420p},
+a video size of @code{1080x1920}, has 8 bytes of padding in each line of Y plane,
+and 4 bytes of padding with UV plane,
+@example
+ffplay -f rawvideo -pixel_format yuv420p -video_size 1080x1920 -stride 1088,544,544 input.raw
 @end example
 
 @anchor{rcwtdec}
@@ -1161,10 +1181,51 @@ RIFF Wave Audio demuxer.
 
 This demuxer accepts the following options:
 @table @option
+@item ignore_length @var{bool}
+Ignore the size of the @code{data} chunk and keep reading until the end of the file if set.
+May be useful to read broken or partial files where the header was not properly updated,
+but will misinterpret files with non-audio chunks after the @code{data} chunk.
+Default is disabled.
+
 @item max_size
 Specify the maximum packet size in bytes for the demuxed packets. By default
 this is set to 0, which means that a sensible value is chosen based on the
 input format.
+@end table
+
+@section webp
+
+Animated WebP demuxer.
+
+It accepts the following options:
+
+@table @option
+@item -min_delay @var{int}
+Set the minimum valid delay between frames in milliseconds.
+Range is 0 to 60000. Default value is 10.
+
+@item -max_webp_delay @var{int}
+Set the maximum valid delay between frames in milliseconds.
+Range is 0 to 16777215. Default value is 16777215 (over four hours),
+the maximum value allowed by the specification.
+
+@item -default_delay @var{int}
+Set the default delay between frames in milliseconds.
+Range is 0 to 60000. Default value is 100.
+
+@item -ignore_loop @var{bool}
+WebP files can contain information to loop a certain number of times
+(or infinitely). If @option{ignore_loop} is set to true, then the loop
+setting from the input will be ignored and looping will not occur.
+If set to false, then looping will occur and will cycle the number
+of times according to the WebP. Default value is true.
+
+@item usebgcolor @var{bool}
+WebP files contain a background color hint in the ANIM chunk, but the
+WebP specification says that viewer applications are not required to
+use it. If @option{usebgcolor} is set to true, then the background
+color hint will be used, otherwise transparent black will be used for
+the background. Default value is false.
 @end table
 
 @c man end DEMUXERS

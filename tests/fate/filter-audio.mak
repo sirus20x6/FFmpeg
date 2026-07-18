@@ -75,6 +75,12 @@ fate-filter-amerge: tests/data/asynth-44100-1.wav
 fate-filter-amerge: SRC = $(TARGET_PATH)/tests/data/asynth-44100-1.wav
 fate-filter-amerge: CMD = framecrc -i $(SRC) -i $(SRC) -filter_complex "[0:a][1:a]amerge=inputs=2[aout]" -map "[aout]"
 
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, AMERGE, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-amerge-mode
+fate-filter-amerge-mode: tests/data/asynth-44100-1.wav
+fate-filter-amerge-mode: SRC = $(TARGET_PATH)/tests/data/asynth-44100-1.wav
+fate-filter-amerge-mode: CMD = framecrc -channel_layout FL -i $(SRC) -ss 0.1 -channel_layout FR -i $(SRC) -ss 0.2 -i $(SRC) -ss 0.3 -i $(SRC) -ss 0.4 -i $(SRC) -ss 0.5 -i $(SRC) \
+                               -filter_complex "[1:a][0:a]amerge[tmp1];[2:a][3:a]amerge=layout_mode=reset[tmp2];[tmp1][tmp2][4:a][5:a]amerge=inputs=4:layout_mode=normal[aout]" -map "[aout]"
+
 FATE_AFILTER-$(call FILTERDEMDECENCMUX, APAD, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-apad
 fate-filter-apad: tests/data/asynth-44100-2.wav
 fate-filter-apad: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
@@ -208,7 +214,6 @@ fate-filter-compand: tests/data/filtergraphs/compand
 fate-filter-compand: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
 fate-filter-compand: CMD = framecrc -auto_conversion_filters -i $(SRC) -frames:a 20 -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/compand
 
-tests/data/hls-list.m3u8: TAG = GEN
 tests/data/hls-list.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
         -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t):d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
@@ -218,7 +223,6 @@ FATE_AFILTER-$(call FILTERDEMDECENCMUX, ARESAMPLE AEVALSRC, HLS MPEGTS, MP2 PCM_
 fate-filter-hls: tests/data/hls-list.m3u8
 fate-filter-hls: CMD = framecrc -flags +bitexact -i $(TARGET_PATH)/tests/data/hls-list.m3u8 -af aresample
 
-tests/data/hls-list-append.m3u8: TAG = GEN
 tests/data/hls-list-append.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
         -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t):d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
@@ -258,6 +262,11 @@ fate-filter-aresample: SRC = $(TARGET_SAMPLES)/nellymoser/nellymoser-discont.flv
 fate-filter-aresample: CMD = pcm -analyzeduration 10000000 -i $(SRC) -af aresample=min_comp=0.001:min_hard_comp=0.1:first_pts=0
 fate-filter-aresample: CMP = oneoff
 fate-filter-aresample: REF = $(SAMPLES)/nellymoser/nellymoser-discont.pcm
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, ASELECT, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-aselect
+fate-filter-aselect: tests/data/asynth-44100-2.wav
+fate-filter-aselect: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-aselect: CMD = framecrc -i $(SRC) -af "aselect=gte(t\,1)*lt(t\,2)"
 
 FATE_ATRIM += fate-filter-atrim-duration
 fate-filter-atrim-duration: CMD = framecrc -i $(SRC) -af atrim=start=0.1:duration=0.01

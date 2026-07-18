@@ -8,6 +8,9 @@ FATE_MOV-$(call FRAMEMD5, MOV, H264) += fate-mov-3elist \
            fate-mov-3elist-encrypted \
            fate-mov-frag-encrypted \
            fate-mov-tenc-only-encrypted \
+           fate-mov-3elist-encrypted-kid \
+           fate-mov-frag-encrypted-kid \
+           fate-mov-tenc-only-encrypted-kid \
            fate-mov-frag-overlap \
            fate-mov-neg-firstpts-discard-frames \
 
@@ -34,8 +37,11 @@ FATE_MOV_FFPROBE-$(call FRAMEMD5, MOV, H264, H264_PARSER) += fate-mov-neg-firstp
                    fate-mov-guess-delay-2 \
                    fate-mov-guess-delay-3 \
                    fate-mov-mp4-with-mov-in24-ver \
+                   fate-mov-mime-codecstring \
 
 FATE_MOV_FFPROBE-$(call FRAMEMD5, MOV, MPEG4, H264_PARSER) += fate-mov-mp4-extended-atom \
+
+FATE_MOV_FFPROBE-$(call DEMDEC, MOV, HEVC) += fate-mov-dovi-hvce-mp4-read
 
 FATE_MOV_FASTSTART = fate-mov-faststart-4gb-overflow \
 
@@ -57,6 +63,15 @@ fate-mov-frag-encrypted: CMD = framemd5 -decryption_key 123456789012345678901234
 
 # Full-sample encryption and constant IV using only tenc atom (no senc/saio/saiz).
 fate-mov-tenc-only-encrypted: CMD = framemd5 -decryption_key 12345678901234567890123456789012 -i $(TARGET_SAMPLES)/mov/mov-tenc-only-encrypted.mp4
+
+# Edit list with encryption, using the decryption_keys option.
+fate-mov-3elist-encrypted-kid: CMD = framemd5 -decryption_keys 12345678901234567890123456789012=12345678901234567890123456789012 -i $(TARGET_SAMPLES)/mov/mov-3elist-encrypted.mov
+
+# Fragmented encryption with senc boxes in movie fragments, using the decryption_keys option.
+fate-mov-frag-encrypted-kid: CMD = framemd5 -decryption_keys abba271e8bcf552bbd2e86a434a9a5d9=12345678901234567890123456789012 -i $(TARGET_SAMPLES)/mov/mov-frag-encrypted.mp4
+
+# Full-sample encryption and constant IV using only tenc atom (no senc/saio/saiz), using the decryption_keys option.
+fate-mov-tenc-only-encrypted-kid: CMD = framemd5 -decryption_keys abba271e8bcf552bbd2e86a434a9a5d9=12345678901234567890123456789012 -i $(TARGET_SAMPLES)/mov/mov-tenc-only-encrypted.mp4
 
 # Makes sure that the CTTS is also modified when we fix avindex in mov.c while parsing edit lists.
 fate-mov-elist-starts-ctts-2ndsample: CMD = framemd5 -i $(TARGET_SAMPLES)/mov/mov-elist-starts-ctts-2ndsample.mov
@@ -92,7 +107,7 @@ fate-mov-frag-overlap: CMD = framemd5 -i $(TARGET_SAMPLES)/mov/frag_overlap.mp4
 
 fate-mov-mp4-frag-flush: CMD = md5 -f lavfi -i color=blue,format=rgb24,trim=duration=0.04 -f lavfi -i anullsrc,aformat=s16,atrim=duration=2 -c:v png -c:a pcm_s16le -movflags +empty_moov+hybrid_fragmented -frag_duration 1000000 -frag_interleave 1 -bitexact -f mp4
 fate-mov-mp4-frag-flush: CMP = oneline
-fate-mov-mp4-frag-flush: REF = 48d833e4773f7542f65dadb446f8bf61
+fate-mov-mp4-frag-flush: REF = 46f748faa3b8b59ebeeb789bee75008a
 FATE_MOV_FFMPEG-$(call ALLYES, LAVFI_INDEV COLOR_FILTER FORMAT_FILTER TRIM_FILTER \
                                ANULLSRC_FILTER AFORMAT_FILTER ATRIM_FILTER        \
                                WRAPPED_AVFRAME_DECODER PCM_S16LE_DECODER PCM_S16BE_DECODER \
@@ -130,9 +145,11 @@ fate-mov-read-amve: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream_s
 
 fate-mov-spherical-mono: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream_side_data_list -select_streams v -v 0 $(TARGET_SAMPLES)/mov/spherical.mov
 
+fate-mov-dovi-hvce-mp4-read: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream_side_data_list -select_streams v -v 0 $(TARGET_SAMPLES)/mov/dovi-p7-hvce.mp4
+
 fate-mov-gpmf-remux: CMD = md5 -i $(TARGET_SAMPLES)/mov/fake-gp-media-with-real-gpmf.mp4 -map 0 -c copy -fflags +bitexact -f mp4
 fate-mov-gpmf-remux: CMP = oneline
-fate-mov-gpmf-remux: REF = 6361cf3c2b9e6962c2eafbda138125f4
+fate-mov-gpmf-remux: REF = e919915c5cd22c849e2aba281ddaf0c8
 
 fate-mov-guess-delay-1: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream=has_b_frames -select_streams v $(TARGET_SAMPLES)/h264/h264_3bf_nopyramid_nobsrestriction.mp4
 fate-mov-guess-delay-2: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream=has_b_frames -select_streams v $(TARGET_SAMPLES)/h264/h264_3bf_pyramid_nobsrestriction.mp4
@@ -145,6 +162,8 @@ fate-mov-faststart-4gb-overflow: REF = bc875921f151871e787c4b4023269b29
 fate-mov-mp4-with-mov-in24-ver: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream=codec_name -select_streams 1 $(TARGET_SAMPLES)/mov/mp4-with-mov-in24-ver.mp4
 
 fate-mov-mp4-extended-atom: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_packets -print_format compact -select_streams v $(TARGET_SAMPLES)/mov/extended_atom_size_probe
+
+fate-mov-mime-codecstring: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream=mime_codec_string -v 0 $(TARGET_SAMPLES)/mov/mov_stream_shorter_than_movie.mov
 
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, OGG_DEMUXER VORBIS_DECODER) \
                           += fate-mov-mp4-chapters
@@ -240,6 +259,16 @@ FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, H264_DECODER) \
                           += fate-mov-write-amve
 fate-mov-write-amve: CMD = transcode mov $(TARGET_SAMPLES)/mov/amve.mov mp4 "-c:v copy" "-c:v copy -t 0.5" "-show_entries stream_side_data_list"
 
+# These tests check that Dolby Vision Profile 7 dual-layer content with an
+# hvcE (enhancement-layer HEVC configuration) is preserved on MP4 remux.
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, HEVC_DECODER) \
+                          += fate-mov-dovi-hvce-mp4-to-mp4
+fate-mov-dovi-hvce-mp4-to-mp4: CMD = transcode mov $(TARGET_SAMPLES)/mov/dovi-p7-hvce.mp4 mp4 "-map 0 -c copy -strict unofficial" "-map 0 -c copy" "-show_entries stream_side_data_list -select_streams v"
+
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, MATROSKA_DEMUXER HEVC_DECODER) \
+                          += fate-mov-dovi-hvce-mkv-to-mp4
+fate-mov-dovi-hvce-mkv-to-mp4: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/dovi-p7-hvce.mkv mp4 "-map 0 -c copy -strict unofficial" "-map 0 -c copy" "-show_entries stream_side_data_list -select_streams v"
+
 FATE_SAMPLES_FFMPEG_FFPROBE += $(FATE_MOV_FFMPEG_FFPROBE_SAMPLES-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_MOV_FFMPEG_SAMPLES-yes)
 
@@ -251,8 +280,8 @@ fate-mov-channel-description: CMD = transcode wav $(TARGET_PATH)/tests/data/asyn
 # Test PCM in mp4 and channel layout
 FATE_MOV_FFMPEG-$(call TRANSCODE, PCM_S16LE, MP4 MOV, WAV_DEMUXER PAN_FILTER) \
                           += fate-mov-mp4-pcm
-fate-mov-mp4-pcm: tests/data/asynth-44100-1.wav tests/data/filtergraphs/mov-mp4-pcm
-fate-mov-mp4-pcm: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-44100-1.wav mp4 "-/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/mov-mp4-pcm -map [mono] -map [stereo] -map [2.1] -map [5.1] -map [7.1] -c:a pcm_s16le" "-map 0 -c copy -frames:a 0"
+fate-mov-mp4-pcm: tests/data/asynth-96000-1.wav tests/data/filtergraphs/mov-mp4-pcm
+fate-mov-mp4-pcm: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-96000-1.wav mp4 "-/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/mov-mp4-pcm -map [mono] -map [stereo] -map [2.1] -map [5.1] -map [7.1] -c:a pcm_s16le" "-map 0 -c copy -frames:a 0"
 
 # Test floating sample format PCM in mp4 and unusual channel layout
 FATE_MOV_FFMPEG-$(call TRANSCODE, PCM_F32LE, MP4 MOV, WAV_DEMUXER PAN_FILTER) \
@@ -263,7 +292,7 @@ fate-mov-mp4-pcm-float: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-441
 fate-mov-pcm-remux: tests/data/asynth-44100-1.wav
 fate-mov-pcm-remux: CMD = md5 -i $(TARGET_PATH)/tests/data/asynth-44100-1.wav -map 0 -c copy -fflags +bitexact -f mp4
 fate-mov-pcm-remux: CMP = oneline
-fate-mov-pcm-remux: REF = e76115bc392d702da38f523216bba165
+fate-mov-pcm-remux: REF = 389df40a487ac8397ba20bda472434d7
 
 FATE_MOV_FFMPEG-$(call TRANSCODE, RAWVIDEO, MOV, TESTSRC_FILTER SETPTS_FILTER) += fate-mov-vfr
 fate-mov-vfr: CMD = md5 -filter_complex testsrc=size=2x2:duration=1,setpts=N*N:strip_fps=1 -c rawvideo -fflags +bitexact -f mov
@@ -290,17 +319,36 @@ fate-mov-mp4-iamf-5_1_4: CMD = transcode wav $(SRC) mp4 "-auto_conversion_filter
   "-show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_disposition:stream_group_tags:stream_group_stream=index,id:stream_group_stream_disposition"
 
 # Test muxing an IAMF track alongside a video one, with video as the first track.
-FATE_MOV_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG4, MP4 MOV, WAV_DEMUXER FLAC_DECODER RAWVIDEO_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-mp4-iamf-7_1_4-video-first
-fate-mov-mp4-iamf-7_1_4-video-first: tests/data/asynth-44100-12.wav tests/data/vsynth1.yuv tests/data/filtergraphs/iamf_7_1_4 tests/data/streamgroups/audio_element-7_1_4-2 tests/data/streamgroups/mix_presentation-7_1_4
-fate-mov-mp4-iamf-7_1_4-video-first: SRC = $(TARGET_PATH)/tests/data/asynth-44100-12.wav
-fate-mov-mp4-iamf-7_1_4-video-first: SRC2 = $(TARGET_PATH)/tests/data/vsynth1.yuv
-fate-mov-mp4-iamf-7_1_4-video-first: CMD = transcode wav $(SRC) mp4 "-auto_conversion_filters \
+tests/data/mov-mp4-iamf-7_1_4-video-first.mp4: TAG = GEN
+tests/data/mov-mp4-iamf-7_1_4-video-first.mp4: tests/data/asynth-44100-12.wav tests/data/vsynth1.yuv tests/data/filtergraphs/iamf_7_1_4 tests/data/streamgroups/audio_element-7_1_4-2 tests/data/streamgroups/mix_presentation-7_1_4
+tests/data/mov-mp4-iamf-7_1_4-video-first.mp4: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+  -f wav -i $(TARGET_PATH)/tests/data/asynth-44100-12.wav \
+  -f rawvideo -s 352x288 -pix_fmt yuv420p -flags +bitexact -sws_flags +accurate_rnd+bitexact -i $(TARGET_PATH)/tests/data/vsynth1.yuv \
   -/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/iamf_7_1_4 \
   -/stream_group $(TARGET_PATH)/tests/data/streamgroups/audio_element-7_1_4-2 \
   -/stream_group $(TARGET_PATH)/tests/data/streamgroups/mix_presentation-7_1_4 \
-  -streamid 0:1 -streamid 1:2 -streamid 2:3 -streamid 3:4 -streamid 4:5 -streamid 5:6 -streamid 6:7 -streamid 7:8 -map 1:v:0 -map [FRONT] -map [TOP_FRONT] -map [CENTER] -map [LFE] -map [SIDE] -map [BACK] -map [TOP_BACK] -c:a flac -c:v mpeg4 -t 1" "-c:a copy -c:v copy -map 0" \
-  "-show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_disposition:stream_group_tags:stream_group_stream=index,id:stream_group_stream_disposition:stream=index,id" \
-  "-f rawvideo -s 352x288 -pix_fmt yuv420p -i $(SRC2)"
+  -streamid 0:1 -streamid 1:2 -streamid 2:3 -streamid 3:4 -streamid 4:5 -streamid 5:6 -streamid 6:7 -streamid 7:8 -map 1:v:0 -map "[FRONT]" -map "[TOP_FRONT]" -map "[CENTER]" -map "[LFE]" -map "[SIDE]" -map "[BACK]" -map "[TOP_BACK]" \
+  -flags +bitexact -c:a flac -idct simple -dct fastint -sws_flags +accurate_rnd+bitexact -flags +bitexact -threads 1 -c:v mpeg4 -t 1 -fflags +bitexact -f mp4 $(TARGET_PATH)/tests/data/mov-mp4-iamf-7_1_4-video-first.mp4 -y 2>/dev/null
+
+# Demux everything
+FATE_MOV_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG4, MP4 MOV, WAV_DEMUXER FLAC_DECODER RAWVIDEO_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-mp4-iamf-7_1_4-video-first
+fate-mov-mp4-iamf-7_1_4-video-first: tests/data/mov-mp4-iamf-7_1_4-video-first.mp4
+fate-mov-mp4-iamf-7_1_4-video-first: CMD = stream_demux mp4 $(TARGET_PATH)/tests/data/mov-mp4-iamf-7_1_4-video-first.mp4 \
+  "" "-c:a copy -c:v copy -map 0" \
+  "-show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_disposition:stream_group_tags:stream_group_stream=index,id:stream_group_stream_disposition:stream=index,id"
+
+# Demux the first stream in the IAMF struct
+FATE_MOV_FFMPEG-$(call TRANSCODE, MPEG4, MP4 MOV, WAV_DEMUXER FLAC_DECODER RAWVIDEO_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-mp4-iamf-7_1_4-video-first-2
+fate-mov-mp4-iamf-7_1_4-video-first-2: tests/data/mov-mp4-iamf-7_1_4-video-first.mp4
+fate-mov-mp4-iamf-7_1_4-video-first-2: CMD = stream_demux mp4 $(TARGET_PATH)/tests/data/mov-mp4-iamf-7_1_4-video-first.mp4 \
+  "" "-c:a copy -map 0:g:0:0" \
+
+# Demux the fourth stream in the IAMF struct. See 16ee3d8d99a2
+FATE_MOV_FFMPEG-$(call TRANSCODE, MPEG4, MP4 MOV, WAV_DEMUXER FLAC_DECODER RAWVIDEO_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-mp4-iamf-7_1_4-video-first-3
+fate-mov-mp4-iamf-7_1_4-video-first-3: tests/data/mov-mp4-iamf-7_1_4-video-first.mp4
+fate-mov-mp4-iamf-7_1_4-video-first-3: CMD = stream_demux mp4 $(TARGET_PATH)/tests/data/mov-mp4-iamf-7_1_4-video-first.mp4 \
+  "" "-c:a copy -map 0:g:0:3" \
 
 # Test muxing an IAMF track alongside a video one, with video as the last track. Also, use stream ids as track ids.
 FATE_MOV_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG4, MP4 MOV, WAV_DEMUXER FLAC_DECODER RAWVIDEO_DEMUXER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-mp4-iamf-7_1_4-video-last
@@ -328,6 +376,10 @@ fate-mov-mp4-iamf-ambisonic_1: CMD = transcode wav $(SRC) mp4 "-auto_conversion_
 FATE_MOV_FFMPEG_SAMPLES-$(call REMUX, MP4 MOV, H264_PARSER) \
                           += fate-mov-mp4-multiple-stsd-muxing
 fate-mov-mp4-multiple-stsd-muxing: CMD = transcode mov $(TARGET_SAMPLES)/h264/extradata-reload-multi-stsd.mov mp4 "-c:v copy" "-c:v copy"
+
+FATE_MOV_FFMPEG_SAMPLES-$(call REMUX, MP4 MOV, AAC_PARSER) \
+                          += fate-mov-mp4-edst-remainder
+fate-mov-mp4-edst-remainder: CMD = stream_remux mov $(TARGET_SAMPLES)/audiomatch/tones_fdkaac_44100_stereo_aac_lc.m4a "" mp4 "" "" "-c:a copy"
 
 FATE_FFMPEG += $(FATE_MOV_FFMPEG-yes)
 FATE_FFMPEG_FFPROBE += $(FATE_MOV_FFMPEG_FFPROBE-yes)

@@ -91,7 +91,7 @@ static int query_formats(const AVFilterContext *ctx,
         AV_PIX_FMT_NONE
     };
 
-    ret = ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out,
+    ret = ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out,
                                            s->inplace ? alpha_pix_fmts : no_alpha_pix_fmts);
     if (ret < 0)
         return ret;
@@ -507,8 +507,8 @@ static int premultiply_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_
     int p;
 
     for (p = 0; p < s->nb_planes; p++) {
-        const int slice_start = (s->height[p] * jobnr) / nb_jobs;
-        const int slice_end = (s->height[p] * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(s->height[p], jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(s->height[p], jobnr + 1, nb_jobs);
 
         if (!((1 << p) & s->planes) || p == 3) {
             av_image_copy_plane(out->data[p] + slice_start * out->linesize[p],

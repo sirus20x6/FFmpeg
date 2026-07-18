@@ -46,6 +46,7 @@ typedef struct BufferSourceContext {
     AVRational        time_base;     ///< time_base to set in the output link
     AVRational        frame_rate;    ///< frame_rate to set in the output link
     unsigned          nb_failed_requests;
+    unsigned          warning_limit;
 
     /* video only */
     int               w, h, prev_w, prev_h;
@@ -274,6 +275,16 @@ int attribute_align_arg av_buffersrc_add_frame_flags(AVFilterContext *ctx, AVFra
             return ret;
     }
 
+    FilterLinkInternal *const li = ff_link_internal(ctx->outputs[0]);
+    if (s->warning_limit &&
+        ff_framequeue_queued_frames(&li->fifo) >= s->warning_limit) {
+        av_log(s, AV_LOG_WARNING,
+               "%d buffers queued in %s, something may be wrong.\n",
+               s->warning_limit,
+               (char *)av_x_if_null(ctx->name, ctx->filter->name));
+        s->warning_limit *= 10;
+    }
+
     return 0;
 }
 
@@ -284,6 +295,24 @@ int av_buffersrc_close(AVFilterContext *ctx, int64_t pts, unsigned flags)
     s->eof = 1;
     ff_avfilter_link_set_in_status(ctx->outputs[0], AVERROR_EOF, pts);
     return (flags & AV_BUFFERSRC_FLAG_PUSH) ? push_frame(ctx->graph) : 0;
+}
+
+int av_buffersrc_get_status(AVFilterContext *ctx)
+{
+    BufferSourceContext *s = ctx->priv;
+
+    if (!s->eof && ff_outlink_get_status(ctx->outputs[0]))
+        s->eof = 1;
+
+    return s->eof ? AVERROR(EOF) : 0;
+}
+
+static av_cold int common_init(AVFilterContext *ctx)
+{
+    BufferSourceContext *c = ctx->priv;
+
+    c->warning_limit = 100;
+    return 0;
 }
 
 static av_cold int init_video(AVFilterContext *ctx)
@@ -317,7 +346,7 @@ static av_cold int init_video(AVFilterContext *ctx)
            av_color_space_name(c->color_space), av_color_range_name(c->color_range),
            av_alpha_mode_name(c->alpha_mode));
 
-    return 0;
+    return common_init(ctx);
 }
 
 unsigned av_buffersrc_get_nb_failed_requests(AVFilterContext *buffer_src)
@@ -390,7 +419,6 @@ static av_cold int init_audio(AVFilterContext *ctx)
 {
     BufferSourceContext *s = ctx->priv;
     char buf[128];
-    int ret = 0;
 
     if (s->sample_fmt == AV_SAMPLE_FMT_NONE) {
         av_log(ctx, AV_LOG_ERROR, "Sample format was not set or was invalid\n");
@@ -434,7 +462,7 @@ static av_cold int init_audio(AVFilterContext *ctx)
            s->time_base.num, s->time_base.den, av_get_sample_fmt_name(s->sample_fmt),
            s->sample_rate, buf);
 
-    return ret;
+    return common_init(ctx);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)

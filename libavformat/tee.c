@@ -24,6 +24,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
 #include "libavcodec/bsf.h"
 #include "internal.h"
 #include "avformat.h"
@@ -57,6 +58,7 @@ typedef struct TeeContext {
     unsigned nb_alive;
     TeeSlave *slaves;
     int use_fifo;
+    int stamp_prft_wallclock;
     AVDictionary *fifo_options;
 } TeeContext;
 
@@ -65,9 +67,11 @@ static const char *const slave_bsfs_spec_sep = "/";
 static const char *const slave_select_sep = ",";
 
 #define OFFSET(x) offsetof(TeeContext, x)
-static const AVOption options[] = {
+static const AVOption tee_options[] = {
         {"use_fifo", "Use fifo pseudo-muxer to separate actual muxers from encoder",
          OFFSET(use_fifo), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM},
+        {"stamp_prft_wallclock", "Stamp packets with their tee submission wallclock for exact PRFT/RTP alignment",
+         OFFSET(stamp_prft_wallclock), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_ENCODING_PARAM},
         {"fifo_options", "fifo pseudo-muxer options", OFFSET(fifo_options),
          AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, AV_OPT_FLAG_ENCODING_PARAM},
         {NULL}
@@ -76,7 +80,7 @@ static const AVOption options[] = {
 static const AVClass tee_muxer_class = {
     .class_name = "Tee muxer",
     .item_name  = av_default_item_name,
-    .option = options,
+    .option     = tee_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
@@ -166,6 +170,8 @@ static int open_slave(AVFormatContext *avf, char *slave, TeeSlave *tee_slave)
 
     if ((ret = ff_tee_parse_slave_options(avf, slave, &options, &filename)) < 0)
         return ret;
+
+    tee_slave->on_fail = DEFAULT_SLAVE_FAILURE_POLICY;
 
 #define CONSUME_OPTION(option, field, action) do {                      \
         AVDictionaryEntry *en = av_dict_get(options, option, NULL, 0);  \
@@ -288,6 +294,14 @@ static int open_slave(AVFormatContext *avf, char *slave, TeeSlave *tee_slave)
         st2 = ff_stream_clone(avf2, st);
         if (!st2) {
             ret = AVERROR(ENOMEM);
+            goto end;
+        }
+    }
+
+    for (unsigned i = 0; i < avf->nb_programs; i++) {
+        ret = av_program_copy(avf2, (const AVFormatContext *)avf, avf->programs[i]->id, 0);
+        if (ret < 0) {
+            av_log(avf, AV_LOG_ERROR, "unable to transfer program %d to child muxer\n", avf->programs[i]->id);
             goto end;
         }
     }
@@ -535,6 +549,27 @@ static int tee_write_packet(AVFormatContext *avf, AVPacket *pkt)
     int ret_all = 0, ret;
     unsigned s;
     int s2;
+
+    if (pkt && tee->stamp_prft_wallclock) {
+        AVProducerReferenceTime *prft;
+        size_t side_data_size = 0;
+
+        prft = (AVProducerReferenceTime *)av_packet_get_side_data(
+            pkt, AV_PKT_DATA_PRFT, &side_data_size);
+        if (!prft || side_data_size != sizeof(*prft)) {
+            av_packet_side_data_remove(pkt->side_data, &pkt->side_data_elems,
+                                       AV_PKT_DATA_PRFT);
+            prft = (AVProducerReferenceTime *)av_packet_new_side_data(
+                pkt, AV_PKT_DATA_PRFT, sizeof(*prft));
+            if (!prft)
+                return AVERROR(ENOMEM);
+        }
+        /* The direct WHEP slave is written immediately after this stamp. Its
+         * RTCP sender clock and every CMAF slave now describe the same packet
+         * production instant instead of MP4 fragment-flush time. */
+        prft->wallclock = av_gettime();
+        prft->flags = 24;
+    }
 
     for (unsigned i = 0; i < tee->nb_slaves; i++) {
         AVFormatContext *avf2 = tee->slaves[i].avf;

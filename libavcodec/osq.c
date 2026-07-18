@@ -391,7 +391,7 @@ static int osq_decode_block(AVCodecContext *avctx, AVFrame *frame)
             int32_t *src = s->decode_buffer[ch] + OFFSET;
 
             for (int n = 0; n < nb_samples; n++)
-                dst[n] = av_clip_uint8(src[n] + 0x80);
+                dst[n] = av_clip_uint8(src[n] + 0x80ll);
         }
         break;
     case AV_SAMPLE_FMT_S16P:
@@ -495,6 +495,5 @@ const FFCodec ff_osq_decoder = {
     .p.capabilities   = AV_CODEC_CAP_CHANNEL_CONF |
                         AV_CODEC_CAP_DR1,
     .caps_internal    = FF_CODEC_CAP_INIT_CLEANUP,
-    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_U8P, AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S32P),
     .flush            = osq_flush,
 };

@@ -184,7 +184,7 @@ int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
 
     if (p != end)
         av_log(as, AV_LOG_INFO,
-               "%"PTRDIFF_SPECIFIER" bytes of comment header remain\n", end - p);
+               "%td bytes of comment header remain\n", end - p);
     if (n > 0)
         av_log(as, AV_LOG_INFO,
                "truncated comment header, %i comments not found\n", n);
@@ -230,8 +230,11 @@ static int fixup_vorbis_headers(AVFormatContext *as,
     int i, offset, len, err;
     int buf_len;
     unsigned char *ptr;
+    uint64_t total_len = (uint64_t)priv->len[0] + priv->len[1] + priv->len[2];
+    if (total_len + total_len / 255 + 64 > INT_MAX)
+        return AVERROR_INVALIDDATA;
 
-    len = priv->len[0] + priv->len[1] + priv->len[2];
+    len = total_len;
     buf_len = len + len / 255 + 64;
 
     if (*buf)
@@ -605,6 +608,13 @@ static int vorbis_packet(AVFormatContext *s, int idx)
         priv->comment_size = 0;
         av_freep(&priv->setup);
         priv->setup_size = 0;
+
+        av_vorbis_parse_free(&priv->vp);
+        priv->vp = av_vorbis_parse_init(os->new_extradata, os->new_extradata_size);
+        if (!priv->vp) {
+            av_log(s, AV_LOG_ERROR, "Failed to re-initialize Vorbis parser\n");
+            return AVERROR_INVALIDDATA;
+        }
     }
 
     return skip_packet;

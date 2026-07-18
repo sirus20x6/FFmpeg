@@ -69,6 +69,7 @@ static void nal_send(AVFormatContext *s1, const uint8_t *buf, int size, int last
             skip_aggregate = s->flags & FF_RTP_FLAG_H264_MODE0;
         } else {
             header_size = 2;
+            skip_aggregate = s->flags & FF_RTP_FLAG_HEVC_NO_AP;
         }
 
         // Flush buffered NAL units if the current unit doesn't fit

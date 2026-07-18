@@ -67,12 +67,21 @@ SECTION .text
 %endmacro
 
 %macro HADAMARD8 0
+%if ARCH_X86_64
+    SUMSUB_BADC       w, 0, 1, 2, 3, 8
+    SUMSUB_BADC       w, 4, 5, 6, 7, 8
+    SUMSUB_BADC       w, 0, 2, 1, 3, 8
+    SUMSUB_BADC       w, 4, 6, 5, 7, 8
+    SUMSUB_BADC       w, 0, 4, 1, 5, 8
+    SUMSUB_BADC       w, 2, 6, 3, 7, 8
+%else
     SUMSUB_BADC       w, 0, 1, 2, 3
     SUMSUB_BADC       w, 4, 5, 6, 7
     SUMSUB_BADC       w, 0, 2, 1, 3
     SUMSUB_BADC       w, 4, 6, 5, 7
     SUMSUB_BADC       w, 0, 4, 1, 5
     SUMSUB_BADC       w, 2, 6, 3, 7
+%endif
 %endmacro
 
 %macro ABS1_SUM 3
@@ -112,7 +121,6 @@ SECTION .text
 ; about 100k on extreme inputs. But that's very unlikely to occur in natural video,
 ; and it's even more unlikely to not have any alternative mvs/modes with lower cost.
 %macro HSUM 3
-%if cpuflag(sse2)
     movhlps         %2, %1
     paddusw         %1, %2
     pshuflw         %2, %1, 0xE
@@ -120,55 +128,10 @@ SECTION .text
     pshuflw         %2, %1, 0x1
     paddusw         %1, %2
     movd            %3, %1
-%elif cpuflag(mmxext)
-    pshufw          %2, %1, 0xE
-    paddusw         %1, %2
-    pshufw          %2, %1, 0x1
-    paddusw         %1, %2
-    movd            %3, %1
-%elif cpuflag(mmx)
-    mova            %2, %1
-    psrlq           %1, 32
-    paddusw         %1, %2
-    mova            %2, %1
-    psrlq           %1, 16
-    paddusw         %1, %2
-    movd            %3, %1
-%endif
 %endmacro
 
-%macro STORE4 5
-    mova [%1+mmsize*0], %2
-    mova [%1+mmsize*1], %3
-    mova [%1+mmsize*2], %4
-    mova [%1+mmsize*3], %5
-%endmacro
-
-%macro LOAD4 5
-    mova            %2, [%1+mmsize*0]
-    mova            %3, [%1+mmsize*1]
-    mova            %4, [%1+mmsize*2]
-    mova            %5, [%1+mmsize*3]
-%endmacro
-
-%macro hadamard8_16_wrapper 2
-cglobal hadamard8_diff, 4, 4, %1
-%ifndef m8
-    %assign pad %2*mmsize-(4+stack_offset&(mmsize-1))
-    SUB            rsp, pad
-%endif
-    call hadamard8x8_diff %+ SUFFIX
-%ifndef m8
-    ADD            rsp, pad
-%endif
-    RET
-
-cglobal hadamard8_diff16, 5, 6, %1
-%ifndef m8
-    %assign pad %2*mmsize-(4+stack_offset&(mmsize-1))
-    SUB            rsp, pad
-%endif
-
+%macro HADAMARD8_DIFF 1
+cglobal hadamard8_diff16, 5, 6, %1, 2*mmsize*ARCH_X86_32
     call hadamard8x8_diff %+ SUFFIX
     mov            r5d, eax
 
@@ -192,14 +155,14 @@ cglobal hadamard8_diff16, 5, 6, %1
 
 .done:
     mov            eax, r5d
-%ifndef m8
-    ADD            rsp, pad
-%endif
     RET
-%endmacro
 
-%macro HADAMARD8_DIFF 0-1
-%if cpuflag(sse2)
+cglobal hadamard8_diff, 4, 4, %1, 2*mmsize*ARCH_X86_32
+    TAIL_CALL hadamard8x8_diff %+ SUFFIX, 0
+
+; r1, r2 and r3 are not clobbered in this function, so 16x16 can
+; simply call this 2x2x (and that's why we access rsp+gprsize
+; everywhere, which is rsp of calling function)
 hadamard8x8_diff %+ SUFFIX:
     lea                          r0, [r3*3]
     DIFF_PIXELS_8                r1, r2,  0, r3, r0, rsp+gprsize
@@ -214,61 +177,7 @@ hadamard8x8_diff %+ SUFFIX:
     HSUM                        m0, m1, eax
     and                         eax, 0xFFFF
     ret
-
-hadamard8_16_wrapper %1, 3
-%elif cpuflag(mmx)
-ALIGN 16
-; int ff_hadamard8_diff_ ## cpu(MPVEncContext *s, const uint8_t *src1,
-;                               const uint8_t *src2, ptrdiff_t stride, int h)
-; r0 = void *s = unused, int h = unused (always 8)
-; note how r1, r2 and r3 are not clobbered in this function, so 16x16
-; can simply call this 2x2x (and that's why we access rsp+gprsize
-; everywhere, which is rsp of calling func
-hadamard8x8_diff %+ SUFFIX:
-    lea                          r0, [r3*3]
-
-    ; first 4x8 pixels
-    DIFF_PIXELS_8                r1, r2,  0, r3, r0, rsp+gprsize+0x60
-    HADAMARD8
-    mova         [rsp+gprsize+0x60], m7
-    TRANSPOSE4x4W                 0,  1,  2,  3,  7
-    STORE4              rsp+gprsize, m0, m1, m2, m3
-    mova                         m7, [rsp+gprsize+0x60]
-    TRANSPOSE4x4W                 4,  5,  6,  7,  0
-    STORE4         rsp+gprsize+0x40, m4, m5, m6, m7
-
-    ; second 4x8 pixels
-    DIFF_PIXELS_8                r1, r2,  4, r3, r0, rsp+gprsize+0x60
-    HADAMARD8
-    mova         [rsp+gprsize+0x60], m7
-    TRANSPOSE4x4W                 0,  1,  2,  3,  7
-    STORE4         rsp+gprsize+0x20, m0, m1, m2, m3
-    mova                         m7, [rsp+gprsize+0x60]
-    TRANSPOSE4x4W                 4,  5,  6,  7,  0
-
-    LOAD4          rsp+gprsize+0x40, m0, m1, m2, m3
-    HADAMARD8
-    ABS_SUM_8x8_32 rsp+gprsize+0x60
-    mova         [rsp+gprsize+0x60], m0
-
-    LOAD4          rsp+gprsize     , m0, m1, m2, m3
-    LOAD4          rsp+gprsize+0x20, m4, m5, m6, m7
-    HADAMARD8
-    ABS_SUM_8x8_32 rsp+gprsize
-    paddusw                      m0, [rsp+gprsize+0x60]
-
-    HSUM                         m0, m1, eax
-    and                         rax, 0xFFFF
-    ret
-
-hadamard8_16_wrapper 0, 14
-%endif
 %endmacro
-
-%if HAVE_ALIGNED_STACK == 0
-INIT_MMX mmxext
-HADAMARD8_DIFF
-%endif
 
 INIT_XMM sse2
 %if ARCH_X86_64
@@ -900,3 +809,175 @@ VSAD_APPROX 8,  a
 INIT_XMM sse2
 VSAD_APPROX 16, a
 VSAD_APPROX 16, u
+
+;---------------------------------------------------------------------
+;int ff_median_sad_<opt>(MPVEncContext *v, const uint8_t *pix1, const uint8_t *pix2,
+;                        ptrdiff_t stride, int h);
+;---------------------------------------------------------------------
+
+; Load one row of 16 pixels from pix1/pix2 and compute V = pix1 - pix2 as
+; int16 words.  No zero register is needed: both byte vectors are unpacked
+; against the same scratch register %5, so its garbage high bytes cancel in
+; the subtraction.  The shifted columns are derived from the unshifted word
+; vectors, so no out-of-bounds loads are made.
+; %1: V columns 0-7,  %2: V columns 8-15
+; %3: 0w followed by V columns 0-6,  %4: V columns 7-15
+; %5: scratch register, its contents are irrelevant
+%macro LOAD_V16 5
+    movu      %1, [pix1q]
+    movu      %3, [pix2q]
+    punpckhbw %2, %1, %5
+    punpcklbw %1, %5
+    punpckhbw %4, %3, %5
+    punpcklbw %3, %5
+    psubw     %1, %3            ; V columns 0-7
+    psubw     %2, %4            ; V columns 8-15
+    pslldq    %3, %1, 2         ; 0w followed by V columns 0-6
+    palignr   %4, %2, %1, 14    ; V columns 7-14
+%endmacro
+
+; Same as LOAD_V16 for one row of 8 pixels.
+; %1: V columns 0-7, %2: 0w followed by V columns 0-6, %3: scratch register
+%macro LOAD_V8 3
+    movq      %1, [pix1q]
+    movq      %2, [pix2q]
+    punpcklbw %1, %3
+    punpcklbw %2, %3
+    psubw     %1, %2            ; V columns 0-7
+    pslldq    %2, %1, 2         ; 0w, V columns 0-6
+%endmacro
+
+; Accumulate abs(%5 - mid_pred(%2, %3, %2 + %3 - %4)) into %1, using
+; mid_pred(a, b, c) == max(min(a, b), min(max(a, b), c)).
+; %1: accumulator, %2: top (clobbered), %3: left, %4: topleft (clobbered),
+; %5: values being predicted, %6 scratch register
+%macro MEDIAN_ABS_ACC 6
+    paddw     %6, %2, %3        ; top + left
+    psubw     %6, %4            ; top + left - topleft
+    pminsw    %4, %2, %3        ; min(top, left)
+    pmaxsw    %2, %3            ; max(top, left)
+    pminsw    %2, %6
+    pmaxsw    %4, %2            ; mid_pred(top, left, top + left - topleft)
+    psubw     %4, %5
+    pabsw     %4, %4
+    paddw     %1, %4
+%endmacro
+
+%if ARCH_X86_64
+; Accumulate one row's cost from the previous and current row vectors.
+; %1-%4: previous row V (columns 0-7, 8-15, 0-6, 7-14)
+; %5-%8: current  row V (columns 0-7, 8-15, 0-6, 7-14), loaded here
+; m0 is the accumulator, m11/m12 temporaries, m14 scratch.  The top
+; predictors %3/%4 are consumed by MEDIAN_ABS_ACC, but they belong to the
+; previous row and are reloaded before being needed again.
+%macro PROCESS_ROW16 8
+    LOAD_V16  %5, %6, %7, %8, m10
+    add       pix1q, strideq
+    add       pix2q, strideq
+    ; columns 0-7; no special case for the first element lacking
+    ; left and top-left predictors is needed here: The left vectors
+    ; have 0 as first element which leads to the desired result.
+    MEDIAN_ABS_ACC m0, %1, %7, %3, %5, m9
+    ; columns 8-15
+    MEDIAN_ABS_ACC m0, %2, %8, %4, %6, m9
+%endmacro
+
+; Register layout:
+;   m0  accumulator
+;   m1-m4   one row's V (columns 0-7, 8-15, 0-6, 7-14)
+;   m5-m8  the other row's V (columns 0-7, 8-15, 0-6, 7-14)
+;   m9 scratch register
+;   m10 dummy register (unclobbered)
+; The loop is unrolled by two so the two register sets alternate the roles of
+; previous and current row, which removes the per-row register copies.
+%macro MEDIAN_SAD16 0
+cglobal median_sad16, 5, 5, 10, v, pix1, pix2, stride, h
+    LOAD_V16  m1, m2, m3, m4, m10
+    add       pix1q, strideq
+    add       pix2q, strideq
+
+    ; first row: abs(V(0)) + sum of abs(V(j) - V(j-1))
+    psubw     m0, m3, m1
+    psubw     m5, m4, m2
+    pabsw     m0, m0
+    pabsw     m5, m5
+    paddw     m0, m5
+
+    sub       hd, 1
+    jle       .end
+.loop:
+    PROCESS_ROW16 m1, m2, m3, m4, m5, m6, m7, m8
+    sub       hd, 1
+    jle       .end
+    PROCESS_ROW16 m5, m6, m7, m8, m1, m2, m3, m4
+    sub       hd, 1
+    jg        .loop
+.end:
+    ; the per-word sums are at most 2 * 16 * 510, but their total may need
+    ; more than 16 bits: widen to dwords before the horizontal sum
+    pxor      m1, m1
+    punpckhwd m2, m0, m1
+    punpcklwd m0, m1
+    paddd     m0, m2
+    HADDD     m0, m2
+    movd      eax, m0
+    RET
+%endmacro
+
+INIT_XMM ssse3
+MEDIAN_SAD16
+%endif ; ARCH_X86_64
+
+; Accumulate one row's cost from the previous and current row vectors.
+; %1: previous row V columns 0-7, %2: previous row V columns 0-6
+; %3: current  row V columns 0-7, %4: current  row V columns 0-6 (loaded here)
+; m0 is the accumulator, m5 scratch register, m6 unclobbered dummy.
+%macro PROCESS_ROW8 4
+    LOAD_V8   %3, %4, m7
+    add       pix1q, strideq
+    add       pix2q, strideq
+    ; No special case for the first element lacking left and top-left
+    ; predictors is needed here: The left vectors have 0 as first element
+    ; which leads to the desired result.
+    MEDIAN_ABS_ACC m0, %1, %4, %2, %3, m5
+%endmacro
+
+; Register layout:
+;   m0  accumulator for columns 0-7
+;   m1, m2  one row's V (columns 0-7, 0-6)
+;   m3, m4  the other row's V (columns 0-7, 0-6)
+;   m5  scratch register
+;   m7  dummy register, unclobbered
+; As in median_sad16 the loop is unrolled by two so the two register sets
+; alternate the roles of previous and current row.
+%macro MEDIAN_SAD8 0
+cglobal median_sad8, 5, 5, 6, v, pix1, pix2, stride, h
+    LOAD_V8   m1, m2, m7
+    add       pix1q, strideq
+    add       pix2q, strideq
+
+    ; first row: abs(V(0)) + sum of abs(V(j) - V(j-1))
+    psubw     m0, m1, m2
+    pabsw     m0, m0
+
+    sub       hd, 1
+    jle       .end
+.loop:
+    PROCESS_ROW8 m1, m2, m3, m4
+    sub       hd, 1
+    jle       .end
+    PROCESS_ROW8 m3, m4, m1, m2
+    sub       hd, 1
+    jg        .loop
+.end:
+    pxor      m4, m4
+    punpckhwd m1, m0, m4
+    punpcklwd m0, m4
+    paddd     m0, m1
+    HADDD     m0, m1
+    movd      eax, m0
+    RET
+%endmacro
+
+INIT_XMM ssse3
+MEDIAN_SAD8

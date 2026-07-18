@@ -20,18 +20,18 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
-#include "bsf.h"
-#include "bsf_internal.h"
-#include "cbs.h"
-#include "cbs_bsf.h"
-#include "cbs_av1.h"
-#include "cbs_h265.h"
-#include "dovi_rpu.h"
-#include "h2645data.h"
-#include "h265_profile_level.h"
-#include "itut35.h"
+#include "libavcodec/bsf.h"
+#include "libavcodec/bsf_internal.h"
+#include "libavcodec/cbs.h"
+#include "libavcodec/cbs_bsf.h"
+#include "libavcodec/cbs_av1.h"
+#include "libavcodec/cbs_h265.h"
+#include "libavcodec/dovi_rpu.h"
+#include "libavcodec/h2645data.h"
+#include "libavcodec/h265_profile_level.h"
+#include "libavcodec/itut35.h"
 
-#include "hevc/hevc.h"
+#include "libavcodec/hevc/hevc.h"
 
 typedef struct DoviRpuContext {
     CBSBSFContext common;
@@ -84,7 +84,7 @@ static int dovi_rpu_update_fragment_hevc(AVBSFContext *bsf, AVPacket *pkt,
     uint8_t *rpu = NULL;
     int rpu_size, ret;
 
-    // HEVC_NAL_UNSPEC62 is Dolby Vision PRU and HEVC_NAL_UNSPEC63 is Dolby Vision EL
+    // HEVC_NAL_UNSPEC62 is Dolby Vision RPU and HEVC_NAL_UNSPEC63 is Dolby Vision EL
     if (!nal || (nal->type != HEVC_NAL_UNSPEC62 && nal->type != HEVC_NAL_UNSPEC63))
         return 0;
 

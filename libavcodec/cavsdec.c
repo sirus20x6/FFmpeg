@@ -27,7 +27,6 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
-#include "libavutil/emms.h"
 #include "libavutil/mem.h"
 #include "avcodec.h"
 #include "get_bits.h"
@@ -1161,7 +1160,6 @@ static int decode_pic(AVSContext *h)
                 break;
         } while (ff_cavs_next_mb(h));
     }
-    emms_c();
     if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
         av_frame_unref(h->DPB[1].f);
         FFSWAP(AVSFrame, h->cur, h->DPB[1]);
@@ -1280,6 +1278,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                 av_frame_unref(h->DPB[1].f);
                 h->got_keyframe = 1;
             }
+            av_fallthrough;
         case PIC_PB_START_CODE:
             if (frame_start > 1)
                 return AVERROR_INVALIDDATA;

@@ -71,7 +71,7 @@ static int vulkan_encode_init(AVCodecContext *avctx, FFHWBaseEncodePicture *pic)
     /* Input image view */
     err = ff_vk_create_view(&ctx->s, &ctx->common,
                             &vp->in.view, &vp->in.aspect,
-                            vkf, vkfc->format[0], 0);
+                            vkf, vkfc->format[0], VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR);
     if (err < 0)
         return err;
 
@@ -81,7 +81,7 @@ static int vulkan_encode_init(AVCodecContext *avctx, FFHWBaseEncodePicture *pic)
         AVVkFrame *rvkf = (AVVkFrame *)rf->data[0];
         err = ff_vk_create_view(&ctx->s, &ctx->common,
                                 &vp->dpb.view, &vp->dpb.aspect,
-                                rvkf, ctx->pic_format, 1);
+                                rvkf, ctx->pic_format, VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR);
         if (err < 0)
             return err;
     } else {
@@ -182,7 +182,7 @@ static int vulkan_encode_issue(AVCodecContext *avctx,
                                   VK_BUFFER_USAGE_VIDEO_ENCODE_DST_BIT_KHR,
                                   &ctx->profile_list, max_pkt_size,
                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                                  ctx->s.host_cached_flag);
     if (err < 0)
         return err;
 
@@ -635,7 +635,7 @@ static int vulkan_encode_create_dpb(AVCodecContext *avctx, FFVulkanEncodeContext
                                 &ctx->common.layered_view,
                                 &ctx->common.layered_aspect,
                                 (AVVkFrame *)ctx->common.layered_frame->data[0],
-                                hwfc->format[0], 1);
+                                hwfc->format[0], VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR);
         if (err < 0)
             return err;
 
@@ -751,6 +751,8 @@ av_cold int ff_vulkan_encode_init(AVCodecContext *avctx, FFVulkanEncodeContext *
 
     VkVideoFormatPropertiesKHR *ret_info;
     uint32_t nb_out_fmts = 0;
+    const uint32_t feedback_flags = VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR |
+                                    VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR;
 
     VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR quality_info;
 
@@ -871,6 +873,14 @@ av_cold int ff_vulkan_encode_init(AVCodecContext *avctx, FFVulkanEncodeContext *
         return AVERROR_EXTERNAL;
     }
 
+    if ((ctx->enc_caps.supportedEncodeFeedbackFlags & feedback_flags) !=
+        feedback_flags) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Driver does not support required encode feedback flags "
+               "(BUFFER_OFFSET and BYTES_WRITTEN).\n");
+        return AVERROR(ENOTSUP);
+    }
+
     err = init_rc(avctx, ctx);
     if (err < 0)
         return err;
@@ -879,8 +889,7 @@ av_cold int ff_vulkan_encode_init(AVCodecContext *avctx, FFVulkanEncodeContext *
     query_create = (VkQueryPoolVideoEncodeFeedbackCreateInfoKHR) {
         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_VIDEO_ENCODE_FEEDBACK_CREATE_INFO_KHR,
         .pNext = &ctx->profile,
-        .encodeFeedbackFlags = ctx->enc_caps.supportedEncodeFeedbackFlags &
-                               (~VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR),
+        .encodeFeedbackFlags = feedback_flags,
     };
     err = ff_vk_exec_pool_init(s, ctx->qf_enc, &ctx->enc_pool, base_ctx->async_depth,
                                1, VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR, 0,

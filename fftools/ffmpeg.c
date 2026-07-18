@@ -78,6 +78,9 @@
 #include "libavdevice/avdevice.h"
 
 #include "cmdutils.h"
+#if CONFIG_MEDIACODEC
+#include "compat/android/binder.h"
+#endif
 #include "ffmpeg.h"
 #include "ffmpeg_sched.h"
 #include "ffmpeg_utils.h"
@@ -213,6 +216,16 @@ void term_init(void)
 #endif
 
 #if HAVE_TERMIOS_H
+    /* A closed fd 0 is later reused by the first opened input file. read_key()
+     * would then read from that input instead of the terminal and corrupt the
+     * stream, so disable interaction when fd 0 is not an open descriptor.
+     */
+    if (stdin_interaction && fcntl(0, F_GETFD) == -1) {
+        av_log(NULL, AV_LOG_WARNING,
+               "fd 0 is not an open file descriptor, stdin interaction disabled\n");
+        stdin_interaction = 0;
+    }
+
     if (stdin_interaction) {
         struct termios tty;
         if (tcgetattr (0, &tty) == 0) {
@@ -250,7 +263,6 @@ void term_init(void)
 /* read a key without blocking */
 static int read_key(void)
 {
-    unsigned char ch = -1;
 #if HAVE_TERMIOS_H
     int n = 1;
     struct timeval tv;
@@ -262,6 +274,7 @@ static int read_key(void)
     tv.tv_usec = 0;
     n = select(1, &rfds, NULL, NULL, &tv);
     if (n > 0) {
+        unsigned char ch;
         n = read(0, &ch, 1);
         if (n == 1)
             return ch;
@@ -286,6 +299,7 @@ static int read_key(void)
         }
         //Read it
         if(nchars != 0) {
+            unsigned char ch;
             if (read(0, &ch, 1) == 1)
                 return ch;
             return 0;
@@ -297,7 +311,7 @@ static int read_key(void)
     if(kbhit())
         return(getch());
 #endif
-    return ch;
+    return -1;
 }
 
 static int decode_interrupt_cb(void *ctx)
@@ -1018,6 +1032,10 @@ int main(int argc, char **argv)
         ret = 1;
         goto finish;
     }
+
+#if CONFIG_MEDIACODEC
+    android_binder_threadpool_init_if_required();
+#endif
 
     current_time = ti = get_benchmark_time_stamps();
     ret = transcode(sch);

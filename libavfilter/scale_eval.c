@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
 #include <stdint.h>
 #include "scale_eval.h"
 #include "libavutil/eval.h"
@@ -83,18 +84,27 @@ int ff_scale_eval_dimensions(void *log_ctx,
     av_expr_parse_and_eval(&res, (expr = w_expr),
                            var_names, var_values,
                            NULL, NULL, NULL, NULL, NULL, 0, log_ctx);
-    eval_w = var_values[VAR_OUT_W] = var_values[VAR_OW] = (int) res == 0 ? inlink->w : (int) res;
+    var_values[VAR_OUT_W] = var_values[VAR_OW] = res == 0 ? inlink->w : trunc(res);
 
     if ((ret = av_expr_parse_and_eval(&res, (expr = h_expr),
                                       var_names, var_values,
                                       NULL, NULL, NULL, NULL, NULL, 0, log_ctx)) < 0)
         goto fail;
+    if (!(res >= INT32_MIN && res <= INT32_MAX)) {
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
     eval_h = var_values[VAR_OUT_H] = var_values[VAR_OH] = (int) res == 0 ? inlink->h : (int) res;
     /* evaluate again the width, as it may depend on the output height */
     if ((ret = av_expr_parse_and_eval(&res, (expr = w_expr),
                                       var_names, var_values,
                                       NULL, NULL, NULL, NULL, NULL, 0, log_ctx)) < 0)
         goto fail;
+    if (!(res >= INT32_MIN && res <= INT32_MAX)) {
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
     eval_w = (int) res == 0 ? inlink->w : (int) res;
 
     *ret_w = eval_w;
@@ -116,7 +126,7 @@ int ff_scale_adjust_dimensions(AVFilterLink *inlink,
     double w_adj)
 {
     int64_t w, h;
-    int factor_w, factor_h;
+    int64_t factor_w, factor_h;
 
     w = *ret_w;
     h = *ret_h;
@@ -176,6 +186,13 @@ int ff_scale_adjust_dimensions(AVFilterLink *inlink,
 
     if ((int32_t)w != w || (int32_t)h != h)
         return AVERROR(EINVAL);
+
+    if (w <= 0 || h <= 0) {
+        av_log(inlink->dst, AV_LOG_ERROR,
+               "Rescaled dimensions %"PRId64"x%"PRId64" are invalid, "
+               "output dimensions must be positive.\n", w, h);
+        return AVERROR(EINVAL);
+    }
 
     *ret_w = w;
     *ret_h = h;

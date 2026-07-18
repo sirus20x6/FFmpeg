@@ -20,6 +20,7 @@
  */
 
 #include "avformat.h"
+#include "libavutil/attributes.h"
 #include "mpegts.h"
 #include "internal.h"
 #include "mux.h"
@@ -33,7 +34,7 @@
 static const AVOption options[] = {
     FF_RTP_FLAG_OPTS(RTPMuxContext, flags),
     { "payload_type", "Specify RTP payload type", offsetof(RTPMuxContext, payload_type), AV_OPT_TYPE_INT, {.i64 = -1 }, -1, 127, AV_OPT_FLAG_ENCODING_PARAM },
-    { "ssrc", "Stream identifier", offsetof(RTPMuxContext, ssrc), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
+    { "ssrc", "Stream identifier", offsetof(RTPMuxContext, ssrc), AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT32_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "cname", "CNAME to include in RTCP SR packets", offsetof(RTPMuxContext, cname), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
     { "seq", "Starting sequence number", offsetof(RTPMuxContext, seq), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 65535, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL },
@@ -178,9 +179,16 @@ static int rtp_write_header(AVFormatContext *s1)
     case AV_CODEC_ID_MPEG2VIDEO:
         break;
     case AV_CODEC_ID_MPEG2TS:
+        if (s->max_payload_size < TS_PACKET_SIZE) {
+            av_log(s1, AV_LOG_ERROR,
+                   "RTP payload size %u too small for MPEG-TS "
+                   "(minimum %d bytes required)\n",
+                   s->max_payload_size, TS_PACKET_SIZE);
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
         n = s->max_payload_size / TS_PACKET_SIZE;
-        if (n < 1)
-            n = 1;
         s->max_payload_size = n * TS_PACKET_SIZE;
         break;
     case AV_CODEC_ID_DIRAC:
@@ -226,16 +234,6 @@ static int rtp_write_header(AVFormatContext *s1)
         if (st->codecpar->width <= 0 || st->codecpar->height <= 0) {
             av_log(s1, AV_LOG_ERROR, "dimensions not set\n");
             return AVERROR(EINVAL);
-        }
-        break;
-    case AV_CODEC_ID_VP9:
-        if (s1->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
-            av_log(s, AV_LOG_ERROR,
-                   "Packetizing VP9 is experimental and its specification is "
-                   "still in draft state. "
-                   "Please set -strict experimental in order to enable it.\n");
-            ret = AVERROR_EXPERIMENTAL;
-            goto fail;
         }
         break;
     case AV_CODEC_ID_AV1:
@@ -314,8 +312,21 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
     av_log(s1, AV_LOG_TRACE, "RTCP: %02x %"PRIx64" %"PRIx32"\n", s->payload_type, ntp_time, s->timestamp);
 
     s->last_rtcp_ntp_time = ntp_time;
-    rtp_ts = av_rescale_q(ntp_time - s->first_rtcp_ntp_time, (AVRational){1, 1000000},
-                          s1->streams[0]->time_base) + s->base_timestamp;
+    if (s->flags & FF_RTP_FLAG_PKT_TS_SR) {
+        /* A realtime-paced sender emits each packet at its (DTS) air
+         * time, so (the outgoing packet's DTS as an RTP value, NTP now)
+         * is a truthful clock pair. The wall-elapsed extrapolation below
+         * is not: it anchors to muxer creation, which precedes the first
+         * packet by the whole hold_until_publish window, skewing
+         * receiver A/V sync and captureTime by that gap. */
+        rtp_ts = s->sr_pkt_ts;
+    } else {
+        rtp_ts = av_rescale_q(ntp_time - s->first_rtcp_ntp_time, (AVRational){1, 1000000},
+                              s1->streams[0]->time_base) + s->base_timestamp;
+    }
+    av_log(s1, AV_LOG_DEBUG, "SR ssrc=%u pt=%d unix_ms=%.3f rtp_ts=%u base=%u cur=%u\n",
+           s->ssrc, s->payload_type, (ntp_time - NTP_OFFSET_US) / 1000.0,
+           rtp_ts, s->base_timestamp, s->cur_timestamp);
     avio_w8(s1->pb, RTP_VERSION << 6);
     avio_w8(s1->pb, RTCP_SR);
     avio_wb16(s1->pb, 6); /* length in words - 1 */
@@ -543,20 +554,35 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
     RTPMuxContext *s = s1->priv_data;
     AVStream *st = s1->streams[0];
     int rtcp_bytes;
+    int64_t sr_interval_us = 5000000;
     int size= pkt->size;
 
     av_log(s1, AV_LOG_TRACE, "%d: write len=%d\n", pkt->stream_index, size);
 
+    s->cur_timestamp = s->base_timestamp + pkt->pts;
+    /* PKT_TS_SR anchor: realtime pacing runs on DTS, so the stream
+     * position airing at this instant is the packet's DTS, not its PTS.
+     * Anchoring on PTS would wobble the SR line by the B-frame reorder
+     * distance and skew video against audio by up to that much. */
+    s->sr_pkt_ts = s->base_timestamp +
+                   (pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts);
+
     rtcp_bytes = ((s->octet_count - s->last_octet_count) * RTCP_TX_RATIO_NUM) /
         RTCP_TX_RATIO_DEN;
+    /* WebRTC receivers need at least two SRs per stream before A/V sync
+     * and capture-time mapping engage; front-load a few so a fresh
+     * session converges in ~1s instead of ~5s. */
+    if (s->flags & FF_RTP_FLAG_PKT_TS_SR)
+        sr_interval_us = s->sr_fast_count < 4 ? 1000000 : 5000000;
     if ((s->first_packet || ((rtcp_bytes >= RTCP_SR_SIZE) &&
-                            (ff_ntp_time() - s->last_rtcp_ntp_time > 5000000))) &&
+                            (ff_ntp_time() - s->last_rtcp_ntp_time > sr_interval_us))) &&
         !(s->flags & FF_RTP_FLAG_SKIP_RTCP)) {
         rtcp_send_sr(s1, ff_ntp_time(), 0);
         s->last_octet_count = s->octet_count;
         s->first_packet = 0;
+        if (s->sr_fast_count < 4)
+            s->sr_fast_count++;
     }
-    s->cur_timestamp = s->base_timestamp + pkt->pts;
 
     switch(st->codecpar->codec_id) {
     case AV_CODEC_ID_PCM_MULAW:
@@ -623,7 +649,7 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
             ff_rtp_send_h263_rfc2190(s1, pkt->data, size, mb_info, mb_info_size);
             break;
         }
-        /* Fallthrough */
+        av_fallthrough;
     case AV_CODEC_ID_H263P:
         ff_rtp_send_h263(s1, pkt->data, size);
         break;
@@ -638,7 +664,8 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
         ff_rtp_send_vp8(s1, pkt->data, size);
         break;
     case AV_CODEC_ID_VP9:
-        ff_rtp_send_vp9(s1, pkt->data, size);
+        ff_rtp_send_vp9(s1, pkt->data, size,
+                        !!(pkt->flags & AV_PKT_FLAG_KEY));
         break;
     case AV_CODEC_ID_ILBC:
         rtp_send_ilbc(s1, pkt->data, size);
@@ -662,7 +689,7 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
                    size, s->max_payload_size);
             return AVERROR(EINVAL);
         }
-        /* Intentional fallthrough */
+        av_fallthrough;
     default:
         /* better than nothing : send the codec raw data */
         rtp_send_raw(s1, pkt->data, size);
@@ -679,9 +706,15 @@ static int rtp_write_trailer(AVFormatContext *s1)
      * be NULL here even if it was successfully allocated at the start. */
     if (s1->pb && (s->flags & FF_RTP_FLAG_SEND_BYE))
         rtcp_send_sr(s1, ff_ntp_time(), 1);
-    av_freep(&s->buf);
 
     return 0;
+}
+
+static void rtp_deinit(AVFormatContext *s1)
+{
+    RTPMuxContext *s = s1->priv_data;
+
+    av_freep(&s->buf);
 }
 
 const FFOutputFormat ff_rtp_muxer = {
@@ -693,6 +726,7 @@ const FFOutputFormat ff_rtp_muxer = {
     .write_header      = rtp_write_header,
     .write_packet      = rtp_write_packet,
     .write_trailer     = rtp_write_trailer,
+    .deinit            = rtp_deinit,
     .p.priv_class      = &rtp_muxer_class,
     .p.flags           = AVFMT_NODIMENSIONS | AVFMT_TS_NONSTRICT,
 };

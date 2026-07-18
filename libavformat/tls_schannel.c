@@ -680,6 +680,21 @@ int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t ma
 #endif
 }
 
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint)
+{
+    TLSContext *c = h->priv_data;
+    PCCERT_CONTEXT cert = NULL;
+    SECURITY_STATUS status;
+    int ret;
+    status = QueryContextAttributes(&c->ctxt_handle,
+                                    SECPKG_ATTR_REMOTE_CERT_CONTEXT, &cert);
+    if (status != SEC_E_OK || !cert)
+        return AVERROR(EACCES);
+    ret = der_to_fingerprint(cert->pbCertEncoded, cert->cbCertEncoded, fingerprint);
+    CertFreeCertificateContext(cert);
+    return ret;
+}
+
 static void init_sec_buffer(SecBuffer *buffer, unsigned long type,
                             void *data, unsigned long size)
 {
@@ -1065,6 +1080,8 @@ static int tls_server_handshake(URLContext *h)
 
     c->request_flags = ASC_REQ_SEQUENCE_DETECT | ASC_REQ_REPLAY_DETECT |
                        ASC_REQ_CONFIDENTIALITY | ASC_REQ_ALLOCATE_MEMORY;
+    if (s->is_dtls && s->use_srtp)
+        c->request_flags |= ASC_REQ_MUTUAL_AUTH;
     if (s->is_dtls)
         c->request_flags |= ASC_REQ_DATAGRAM;
     else

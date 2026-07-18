@@ -25,11 +25,11 @@
 #include "libavutil/mem.h"
 #include "libavutil/stereo3d.h"
 
-#include "decode.h"
+#include "libavcodec/decode.h"
 #include "hevc.h"
 #include "hevcdec.h"
-#include "progressframe.h"
-#include "thread.h"
+#include "libavcodec/progressframe.h"
+#include "libavcodec/thread.h"
 #include "libavutil/refstruct.h"
 
 void ff_hevc_unref_frame(HEVCFrame *frame, int flags)
@@ -122,10 +122,9 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
             return NULL;
 
         // Add LCEVC SEI metadata here, as it's needed in get_buffer()
-        if (s->sei.common.lcevc.info) {
-            HEVCSEILCEVC *lcevc = &s->sei.common.lcevc;
+        if (s->sei.common.itut_t35.lcevc) {
             ret = ff_frame_new_side_data_from_buf(s->avctx, frame->tf.f,
-                                                  AV_FRAME_DATA_LCEVC, &lcevc->info);
+                                                  AV_FRAME_DATA_LCEVC, &s->sei.common.itut_t35.lcevc);
             if (ret < 0)
                 goto fail;
         }
@@ -162,7 +161,10 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
         if (ret < 0)
             goto fail;
 
-        frame->rpl = av_refstruct_allocz(s->pkt.nb_nals * sizeof(*frame->rpl));
+        size_t rpl_bytes;
+        if (av_size_mult(s->pkt.nb_nals, sizeof(*frame->rpl), &rpl_bytes) < 0)
+            goto fail;
+        frame->rpl = av_refstruct_allocz(rpl_bytes);
         if (!frame->rpl)
             goto fail;
         frame->nb_rpl_elems = s->pkt.nb_nals;
@@ -463,20 +465,20 @@ static void mark_ref(HEVCFrame *frame, int flag)
 static HEVCFrame *generate_missing_ref(HEVCContext *s, HEVCLayerContext *l, int poc)
 {
     HEVCFrame *frame;
-    int i, y;
 
     frame = alloc_frame(s, l);
     if (!frame)
         return NULL;
 
     if (!s->avctx->hwaccel) {
+        int nb_planes = l->sps->chroma_format_idc ? 3 : 1;
         if (!l->sps->pixel_shift) {
-            for (i = 0; frame->f->data[i]; i++)
+            for (int i = 0; i < nb_planes; i++)
                 memset(frame->f->data[i], 1 << (l->sps->bit_depth - 1),
                        frame->f->linesize[i] * AV_CEIL_RSHIFT(l->sps->height, l->sps->vshift[i]));
         } else {
-            for (i = 0; frame->f->data[i]; i++)
-                for (y = 0; y < (l->sps->height >> l->sps->vshift[i]); y++) {
+            for (int i = 0; i < nb_planes; i++)
+                for (int y = 0; y < (l->sps->height >> l->sps->vshift[i]); y++) {
                     uint8_t *dst = frame->f->data[i] + y * frame->f->linesize[i];
                     AV_WN16(dst, 1 << (l->sps->bit_depth - 1));
                     av_memcpy_backptr(dst + 2, 2, 2*(l->sps->width >> l->sps->hshift[i]) - 2);
@@ -626,10 +628,8 @@ int ff_hevc_frame_nb_refs(const SliceHeader *sh, const HEVCPPS *pps,
             ret += !!(rps->used & (1 << i));
     }
 
-    if (long_rps) {
-        for (i = 0; i < long_rps->nb_refs; i++)
-            ret += !!long_rps->used[i];
-    }
+    for (i = 0; i < long_rps->nb_refs; i++)
+        ret += !!long_rps->used[i];
 
     if (sh->inter_layer_pred) {
         av_assert0(pps->sps->vps->num_direct_ref_layers[layer_idx] < 2);

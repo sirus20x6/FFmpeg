@@ -26,7 +26,6 @@
 
 #include "avcodec.h"
 #include "avcodec_internal.h"
-#include "codec_desc.h"
 #include "codec_internal.h"
 #include "decode.h"
 #include "hwaccel_internal.h"
@@ -37,11 +36,9 @@
 #include "libavutil/refstruct.h"
 #include "thread.h"
 #include "threadframe.h"
-#include "version_major.h"
 
 #include "libavutil/avassert.h"
 #include "libavutil/buffer.h"
-#include "libavutil/common.h"
 #include "libavutil/cpu.h"
 #include "libavutil/frame.h"
 #include "libavutil/internal.h"
@@ -361,11 +358,6 @@ static int update_context_from_thread(AVCodecContext *dst, const AVCodecContext 
 
         dst->has_b_frames = src->has_b_frames;
         dst->idct_algo    = src->idct_algo;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-        dst->properties   = src->properties;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
         dst->bits_per_coded_sample = src->bits_per_coded_sample;
         dst->sample_aspect_ratio   = src->sample_aspect_ratio;
@@ -403,6 +395,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
         dst->hwaccel_flags = src->hwaccel_flags;
 
         av_refstruct_replace(&dst->internal->pool, src->internal->pool);
+        ff_decode_internal_sync(dst, src);
     }
 
     if (for_user) {
@@ -559,7 +552,7 @@ static int submit_packet(PerThreadContext *p, AVCodecContext *user_avctx,
     return 0;
 }
 
-int ff_thread_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+int ff_thread_receive_frame(AVCodecContext *avctx, AVFrame *frame, unsigned flags)
 {
     FrameThreadContext *fctx = avctx->internal->thread_ctx;
     int ret = 0;
@@ -571,6 +564,10 @@ int ff_thread_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     /* submit packets to threads while there are no buffered results to return */
     while (!fctx->df.nb_f && !fctx->result) {
         PerThreadContext *p;
+
+        if (fctx->next_decoding != fctx->next_finished &&
+            (flags & AV_CODEC_RECEIVE_FRAME_FLAG_SYNCHRONOUS))
+            goto wait_for_result;
 
         /* get a packet to be submitted to the next thread */
         av_packet_unref(fctx->next_pkt);
@@ -588,6 +585,7 @@ int ff_thread_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             !avctx->internal->draining)
             continue;
 
+    wait_for_result:
         p                   = &fctx->threads[fctx->next_finished];
         fctx->next_finished = (fctx->next_finished + 1) % avctx->thread_count;
 

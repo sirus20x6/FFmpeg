@@ -315,6 +315,21 @@ void avcodec_align_dimensions2(AVCodecContext *s, int *width, int *height,
             h_align = 8;
         }
         break;
+    case AV_PIX_FMT_BAYER_BGGR8:
+    case AV_PIX_FMT_BAYER_RGGB8:
+    case AV_PIX_FMT_BAYER_GBRG8:
+    case AV_PIX_FMT_BAYER_GRBG8:
+    case AV_PIX_FMT_BAYER_BGGR16LE:
+    case AV_PIX_FMT_BAYER_BGGR16BE:
+    case AV_PIX_FMT_BAYER_RGGB16LE:
+    case AV_PIX_FMT_BAYER_RGGB16BE:
+    case AV_PIX_FMT_BAYER_GBRG16LE:
+    case AV_PIX_FMT_BAYER_GBRG16BE:
+    case AV_PIX_FMT_BAYER_GRBG16LE:
+    case AV_PIX_FMT_BAYER_GRBG16BE:
+        w_align = FFMAX(w_align, 2);
+        h_align = FFMAX(h_align, 2);
+        break;
     default:
         break;
     }
@@ -406,20 +421,12 @@ int avpriv_codec_get_cap_skip_frame_fill_param(const AVCodec *codec){
 const char *avcodec_get_name(enum AVCodecID id)
 {
     const AVCodecDescriptor *cd;
-    const AVCodec *codec;
 
     if (id == AV_CODEC_ID_NONE)
         return "none";
     cd = avcodec_descriptor_get(id);
     if (cd)
         return cd->name;
-    av_log(NULL, AV_LOG_WARNING, "Codec 0x%x is not in the full list.\n", id);
-    codec = avcodec_find_decoder(id);
-    if (codec)
-        return codec->name;
-    codec = avcodec_find_encoder(id);
-    if (codec)
-        return codec->name;
     return "unknown_codec";
 }
 
@@ -641,16 +648,16 @@ static int get_audio_frame_duration(enum AVCodecID id, int sr, int ch, int ba,
 
     if (frame_bytes > 0) {
         /* calc from frame_bytes only */
-        if (id == AV_CODEC_ID_TRUESPEECH)
-            return 240 * (frame_bytes / 32);
-        if (id == AV_CODEC_ID_NELLYMOSER)
-            return 256 * (frame_bytes / 64);
-        if (id == AV_CODEC_ID_RA_144)
-            return 160 * (frame_bytes / 20);
-        if (id == AV_CODEC_ID_APTX)
-            return 4 * (frame_bytes / 4);
-        if (id == AV_CODEC_ID_APTX_HD)
-            return 4 * (frame_bytes / 6);
+        int64_t d = INT64_MIN;
+        switch(id) {
+        case AV_CODEC_ID_TRUESPEECH : d = 240LL * (frame_bytes / 32); break;
+        case AV_CODEC_ID_NELLYMOSER : d = 256LL * (frame_bytes / 64); break;
+        case AV_CODEC_ID_RA_144     : d = 160LL * (frame_bytes / 20); break;
+        case AV_CODEC_ID_APTX       : d =   4LL * (frame_bytes /  4); break;
+        case AV_CODEC_ID_APTX_HD    : d =   4LL * (frame_bytes /  6); break;
+        }
+        if (d > INT64_MIN)
+            return ((int)d == d && d > 0) ? d : 0;
 
         if (bps > 0) {
             /* calc from frame_bytes and bits_per_coded_sample */

@@ -29,6 +29,7 @@
 
 #include <inttypes.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/avconfig.h"
 #include "libavutil/bprint.h"
 #include "libavutil/display.h"
@@ -192,6 +193,24 @@ static const struct exif_tag tag_list[] = { // JEITA CP-3451 EXIF specification:
     {"InteropIFD",                 0xA005}, // <- Table 13 Interoperability IFD Attribute Information
     {"GlobalParametersIFD",        0x0190},
     {"ProfileIFD",                 0xc6f5},
+
+    /* Extra FFmpeg tags */
+    { "IFD1",                      0xFFFC},
+    { "IFD2",                      0xFFFB},
+    { "IFD3",                      0xFFFA},
+    { "IFD4",                      0xFFF9},
+    { "IFD5",                      0xFFF8},
+    { "IFD6",                      0xFFF7},
+    { "IFD7",                      0xFFF6},
+    { "IFD8",                      0xFFF5},
+    { "IFD9",                      0xFFF4},
+    { "IFD10",                     0xFFF3},
+    { "IFD11",                     0xFFF2},
+    { "IFD12",                     0xFFF1},
+    { "IFD13",                     0xFFF0},
+    { "IFD14",                     0xFFEF},
+    { "IFD15",                     0xFFEE},
+    { "IFD16",                     0xFFED},
 };
 
 /* same as type_sizes but with string == 1 */
@@ -252,6 +271,9 @@ static inline void tput64(PutByteContext *pb, const int le, const uint64_t value
 
 static int exif_read_values(void *logctx, GetByteContext *gb, int le, AVExifEntry *entry)
 {
+    if (exif_sizes[entry->type] * entry->count > bytestream2_get_bytes_left(gb))
+        return AVERROR_INVALIDDATA;
+
     switch (entry->type) {
         case AV_TIFF_SHORT:
         case AV_TIFF_LONG:
@@ -476,6 +498,11 @@ static int exif_decode_tag(void *logctx, GetByteContext *gb, int le,
     av_log(logctx, AV_LOG_DEBUG, "TIFF Tag: id: 0x%04x, type: %d, count: %u, offset: %d, "
                                  "payload: %" PRIu32 "\n", entry->id, type, count, tell, payload);
 
+    if (!type) {
+        av_log(logctx, AV_LOG_DEBUG, "Skipping invalid TIFF tag 0\n");
+        goto end;
+    }
+
     /* AV_TIFF_IFD is the largest, numerically */
     if (type > AV_TIFF_IFD || count >= INT_MAX/8U)
         return AVERROR_INVALIDDATA;
@@ -511,7 +538,6 @@ static int exif_decode_tag(void *logctx, GetByteContext *gb, int le,
              * but we were probably incorrect at this
              * point so we try again as a binary blob
              */
-            av_exif_free(&entry->value.ifd);
             av_log(logctx, AV_LOG_DEBUG, "unrecognized MakerNote IFD, retrying as blob\n");
             is_ifd = 0;
         }
@@ -537,41 +563,50 @@ static int exif_parse_ifd_list(void *logctx, GetByteContext *gb, int le,
     uint32_t entries;
     size_t required_size;
     void *temp;
+    int ret = 0;
 
     av_log(logctx, AV_LOG_DEBUG, "parsing IFD list at offset: %d\n", bytestream2_tell(gb));
 
     if (bytestream2_get_bytes_left(gb) < 2) {
         av_log(logctx, guess ? AV_LOG_DEBUG : AV_LOG_ERROR,
                "not enough bytes remaining in EXIF buffer: 2 required\n");
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto end;
     }
 
     entries = ff_tget_short(gb, le);
     if (bytestream2_get_bytes_left(gb) < entries * BASE_TAG_SIZE) {
         av_log(logctx, guess ? AV_LOG_DEBUG : AV_LOG_ERROR,
                "not enough bytes remaining in EXIF buffer. entries: %" PRIu32 "\n", entries);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto end;
     }
     if (entries > 4096) {
         /* that is a lot of entries, probably an error */
         av_log(logctx, guess ? AV_LOG_DEBUG : AV_LOG_ERROR,
                "too many entries: %" PRIu32 "\n", entries);
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto end;
     }
 
     ifd->count = entries;
     av_log(logctx, AV_LOG_DEBUG, "entry count for IFD: %u\n", ifd->count);
 
     /* empty IFD is technically legal but equivalent to no metadata present */
-    if (!ifd->count)
+    if (!ifd->count) {
+        ret = 0;
         goto end;
+    }
 
-    if (av_size_mult(ifd->count, sizeof(*ifd->entries), &required_size) < 0)
-        return AVERROR(ENOMEM);
+    if (av_size_mult(ifd->count, sizeof(*ifd->entries), &required_size) < 0) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
     temp = av_fast_realloc(ifd->entries, &ifd->size, required_size);
     if (!temp) {
         av_freep(&ifd->entries);
-        return AVERROR(ENOMEM);
+        ret = AVERROR(ENOMEM);
+        goto end;
     }
     ifd->entries = temp;
 
@@ -580,17 +615,29 @@ static int exif_parse_ifd_list(void *logctx, GetByteContext *gb, int le,
     memset(ifd->entries, 0, required_size);
 
     for (uint32_t i = 0; i < entries; i++) {
-        int ret = exif_decode_tag(logctx, gb, le, depth, &ifd->entries[i]);
+        ret = exif_decode_tag(logctx, gb, le, depth, &ifd->entries[i]);
         if (ret < 0)
-            return ret;
+            goto end;
     }
 
 end:
+    if (ret < 0) {
+        av_exif_free(ifd);
+        return ret;
+    }
     /*
      * at the end of an IFD is an pointer to the next IFD
      * or zero if there are no more IFDs, which is usually the case
      */
-    return ff_tget_long(gb, le);
+    ret = ff_tget_long(gb, le);
+
+    /* overflow */
+    if (ret < 0) {
+        ret = AVERROR_INVALIDDATA;
+        av_exif_free(ifd);
+    }
+
+    return ret;
 }
 
 /*
@@ -708,12 +755,16 @@ int av_exif_write(void *logctx, const AVExifMetadata *ifd, AVBufferRef **buffer,
     AVBufferRef *buf = NULL;
     size_t size, headsize = 8;
     PutByteContext pb;
-    int ret, off = 0;
+    int ret = 0, off = 0, next;
+    AVExifMetadata *ifd_new = NULL;
+    AVExifMetadata extra_ifds[16] = { 0 };
 
     int le = 1;
 
-    if (*buffer)
-        return AVERROR(EINVAL);
+    if (*buffer) {
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
 
     size = exif_get_ifd_size(ifd);
     switch (header_mode) {
@@ -732,9 +783,10 @@ int av_exif_write(void *logctx, const AVExifMetadata *ifd, AVBufferRef **buffer,
             headsize = 0;
             break;
     }
-    buf = av_buffer_alloc(size + off + headsize);
-    if (!buf)
-        return AVERROR(ENOMEM);
+
+    ret = av_buffer_realloc(&buf, size + off + headsize);
+    if (ret < 0)
+        goto end;
 
     if (header_mode == AV_EXIF_EXIF00) {
         AV_WL32(buf->data, MKTAG('E','x','i','f'));
@@ -752,16 +804,79 @@ int av_exif_write(void *logctx, const AVExifMetadata *ifd, AVBufferRef **buffer,
         tput32(&pb, le, 8);
     }
 
-    ret = exif_write_ifd(logctx, &pb, le, 0, ifd);
-    if (ret < 0) {
-        av_buffer_unref(&buf);
-        av_log(logctx, AV_LOG_ERROR, "error writing EXIF data: %s\n", av_err2str(ret));
-        return ret;
+    int extras = 0;
+    for (int i = 0; i < FF_ARRAY_ELEMS(extra_ifds); i++) {
+        AVExifEntry *extra_entry = NULL;
+        uint16_t extra_tag = 0xFFFCu - i;
+        ret = av_exif_get_entry(logctx, (AVExifMetadata *) ifd, extra_tag, 0, &extra_entry);
+        if (ret < 0)
+            break;
+        if (!ret)
+            continue;
+        av_log(logctx, AV_LOG_DEBUG, "found extra IFD tag: %04x\n", extra_tag);
+        if (!ifd_new) {
+            ifd_new = av_exif_clone_ifd(ifd);
+            if (!ifd_new)
+                break;
+            ifd = ifd_new;
+        }
+        /* calling remove_entry will call av_exif_free on the original */
+        AVExifMetadata *cloned = av_exif_clone_ifd(&extra_entry->value.ifd);
+        if (!cloned)
+            break;
+        extra_ifds[extras++] = *cloned;
+        /* don't use av_exif_free here, we want to preserve internals */
+        av_free(cloned);
+        ret = av_exif_remove_entry(logctx, ifd_new, extra_tag, 0);
+        if (ret < 0)
+            break;
     }
 
-    *buffer = buf;
+    if (ret < 0) {
+        av_log(logctx, AV_LOG_ERROR, "error popping additional IFD: %s\n", av_err2str(ret));
+        goto end;
+    }
 
-    return 0;
+    next = bytestream2_tell_p(&pb);
+    ret = exif_write_ifd(logctx, &pb, le, 0, ifd);
+    if (ret < 0) {
+        av_log(logctx, AV_LOG_ERROR, "error writing EXIF data: %s\n", av_err2str(ret));
+        goto end;
+    }
+    next += ret;
+
+    for (int i = 0; i < extras; i++) {
+        av_log(logctx, AV_LOG_DEBUG, "writing additional ifd at: %d\n", next);
+        /* exif_write_ifd always writes 0 i.e. last ifd so we overwrite that here */
+        bytestream2_seek_p(&pb, -4, SEEK_CUR);
+        tput32(&pb, le, next);
+        bytestream2_seek_p(&pb, next, SEEK_SET);
+        ret = exif_write_ifd(logctx, &pb, le, 0, &extra_ifds[i]);
+        if (ret < 0) {
+            av_log(logctx, AV_LOG_ERROR, "error writing additional IFD: %s\n", av_err2str(ret));
+            goto end;
+        }
+        next += ret;
+    }
+
+    /* shrink the buffer to the amount of data we actually used */
+    /* extras don't contribute the initial BASE_TAG_SIZE each */
+    ret = av_buffer_realloc(&buf, buf->size - BASE_TAG_SIZE * extras);
+    if (ret < 0)
+        goto end;
+
+    *buffer = buf;
+    ret = 0;
+
+end:
+    av_exif_free(ifd_new);
+    av_freep(&ifd_new);
+    for (int i = 0; i < FF_ARRAY_ELEMS(extra_ifds); i++)
+        av_exif_free(&extra_ifds[i]);
+    if (ret < 0)
+        av_buffer_unref(&buf);
+
+    return ret;
 }
 
 int av_exif_parse_buffer(void *logctx, const uint8_t *buf, size_t size,
@@ -777,13 +892,13 @@ int av_exif_parse_buffer(void *logctx, const uint8_t *buf, size_t size,
             if (size < 6)
                 return AVERROR_INVALIDDATA;
             off = 6;
-            /* fallthrough */
+            av_fallthrough;
         case AV_EXIF_T_OFF:
             if (size < 4)
                 return AVERROR_INVALIDDATA;
             if (!off)
                 off = AV_RB32(buf) + 4;
-            /* fallthrough */
+            av_fallthrough;
         case AV_EXIF_TIFF_HEADER: {
             int ifd_offset;
             if (size <= off)
@@ -816,12 +931,33 @@ int av_exif_parse_buffer(void *logctx, const uint8_t *buf, size_t size,
      */
     ret = exif_parse_ifd_list(logctx, &gbytes, le, 0, ifd, 0);
     if (ret < 0) {
-        av_exif_free(ifd);
         av_log(logctx, AV_LOG_ERROR, "error decoding EXIF data: %s\n", av_err2str(ret));
         return ret;
     }
+    if (!ret)
+        goto finish;
+    int next = ret;
+    bytestream2_seek(&gbytes, next, SEEK_SET);
 
-    return bytestream2_tell(&gbytes);
+    /* cap at 16 extra IFDs for sanity/parse security */
+    for (int extra_tag = 0xFFFCu; extra_tag > 0xFFECu; extra_tag--) {
+        AVExifMetadata extra_ifd = { 0 };
+        ret = exif_parse_ifd_list(logctx, &gbytes, le, 0, &extra_ifd, 1);
+        if (ret < 0) {
+            av_exif_free(&extra_ifd);
+            break;
+        }
+        next = ret;
+        av_log(logctx, AV_LOG_DEBUG, "found extra IFD: %04x with next=%d\n", extra_tag, ret);
+        bytestream2_seek(&gbytes, next, SEEK_SET);
+        ret = av_exif_set_entry(logctx, ifd, extra_tag, AV_TIFF_IFD, 1, NULL, 0, &extra_ifd);
+        av_exif_free(&extra_ifd);
+        if (ret < 0 || !next || bytestream2_get_bytes_left(&gbytes) <= 0)
+            break;
+    }
+
+finish:
+    return bytestream2_tell(&gbytes) + off;
 }
 
 #define COLUMN_SEP(i, c) ((i) ? ((i) % (c) ? ", " : "\n") : "")
@@ -918,23 +1054,6 @@ int av_exif_ifd_to_dict(void *logctx, const AVExifMetadata *ifd, AVDictionary **
 {
     return exif_ifd_to_dict(logctx, "", ifd, metadata);
 }
-
-#if LIBAVCODEC_VERSION_MAJOR < 63
-int avpriv_exif_decode_ifd(void *logctx, const uint8_t *buf, int size,
-                           int le, int depth, AVDictionary **metadata)
-{
-    AVExifMetadata ifd = { 0 };
-    GetByteContext gb;
-    int ret;
-    bytestream2_init(&gb, buf, size);
-    ret = exif_parse_ifd_list(logctx, &gb, le, depth, &ifd, 0);
-    if (ret < 0)
-        return ret;
-    ret = av_exif_ifd_to_dict(logctx, &ifd, metadata);
-    av_exif_free(&ifd);
-    return ret;
-}
-#endif
 
 #define EXIF_COPY(fname, srcname) do { \
     size_t sz; \
@@ -1060,7 +1179,7 @@ int av_exif_set_entry(void *logctx, AVExifMetadata *ifd, uint16_t id, enum AVTif
     uint32_t count, const uint8_t *ifd_lead, uint32_t ifd_offset, const void *value)
 {
     void *temp;
-    int ret = 0;
+    int ret, offset;
     AVExifEntry *entry = NULL;
     AVExifEntry src = { 0 };
 
@@ -1072,6 +1191,7 @@ int av_exif_set_entry(void *logctx, AVExifMetadata *ifd, uint16_t id, enum AVTif
     ret = av_exif_get_entry(logctx, ifd, id, 0, &entry);
     if (ret < 0)
         return ret;
+    offset = ret;
 
     if (entry) {
         exif_free_entry(entry);
@@ -1099,8 +1219,15 @@ int av_exif_set_entry(void *logctx, AVExifMetadata *ifd, uint16_t id, enum AVTif
 
     ret = exif_clone_entry(entry, &src);
 
-    if (ret < 0)
+    if (ret < 0) {
+        /* offset is the actual offset + 1 */
+        if (offset) {
+            size_t remaining = ifd->count - offset;
+            /* pop the entry off the IFD by shifting everything to the left */
+            memmove(&ifd->entries[offset - 1], &ifd->entries[offset], sizeof(*ifd->entries) * remaining);
+        }
         ifd->count--;
+    }
 
     return ret;
 }
@@ -1130,8 +1257,10 @@ static int exif_remove_entry(void *logctx, AVExifMetadata *ifd, uint16_t id, int
     exif_free_entry(&ifd->entries[index]);
 
     if (index == --ifd->count) {
-        if (!index)
+        if (!index) {
             av_freep(&ifd->entries);
+            ifd->size = 0;
+        }
         return 1;
     }
 
@@ -1250,6 +1379,10 @@ int ff_exif_sanitize_ifd(void *logctx, const AVFrame *frame, AVExifMetadata *ifd
 
     if (sd_orient)
         orientation = av_exif_matrix_to_orientation((int32_t *) sd_orient->data);
+    if (!orientation) {
+        av_log(logctx, AV_LOG_WARNING, "display matrix is singular\n");
+        orientation = 1;
+    }
     if (orientation != 1)
         av_log(logctx, AV_LOG_DEBUG, "matrix contains nontrivial EXIF orientation: %" PRIu64 "\n", orientation);
 
@@ -1321,7 +1454,7 @@ int ff_exif_sanitize_ifd(void *logctx, const AVFrame *frame, AVExifMetadata *ifd
         if (ret < 0)
             goto end;
     }
-    if (!pw && w && w < 0xFFFFu || !ph && h && h < 0xFFFFu) {
+    if (!pw && w && w <= 0xFFFFu || !ph && h && h <= 0xFFFFu) {
         AVExifMetadata *exif;
         AVExifEntry *exif_entry;
         int exif_found = av_exif_get_entry(logctx, ifd, EXIFIFD_TAG, 0, &exif_entry);
@@ -1339,12 +1472,12 @@ int ff_exif_sanitize_ifd(void *logctx, const AVFrame *frame, AVExifMetadata *ifd
             }
             exif = &ifd->entries[ifd->count - 1].value.ifd;
         }
-        if (!pw && w && w < 0xFFFFu) {
+        if (!pw && w && w <= 0xFFFFu) {
             ret = av_exif_set_entry(logctx, exif, PIXEL_X_TAG, AV_TIFF_SHORT, 1, NULL, 0, &w);
             if (ret < 0)
                 goto end;
         }
-        if (!ph && h && h < 0xFFFFu) {
+        if (!ph && h && h <= 0xFFFFu) {
             ret = av_exif_set_entry(logctx, exif, PIXEL_Y_TAG, AV_TIFF_SHORT, 1, NULL, 0, &h);
             if (ret < 0)
                 goto end;
@@ -1369,12 +1502,14 @@ int ff_exif_get_buffer(void *logctx, const AVFrame *frame, AVBufferRef **buffer_
         return AVERROR(EINVAL);
 
     sd_exif = av_frame_get_side_data(frame, AV_FRAME_DATA_EXIF);
-    if (!sd_exif)
+    if (!sd_exif && !av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX))
         return 0;
 
-    ret = av_exif_parse_buffer(logctx, sd_exif->data, sd_exif->size, &ifd, AV_EXIF_TIFF_HEADER);
-    if (ret < 0)
-        goto end;
+    if (sd_exif) {
+        ret = av_exif_parse_buffer(logctx, sd_exif->data, sd_exif->size, &ifd, AV_EXIF_TIFF_HEADER);
+        if (ret < 0)
+            goto end;
+    }
 
     rewrite = ff_exif_sanitize_ifd(logctx, frame, &ifd);
     if (rewrite < 0) {
@@ -1382,13 +1517,23 @@ int ff_exif_get_buffer(void *logctx, const AVFrame *frame, AVBufferRef **buffer_
         goto end;
     }
 
+    /*
+     * we always have to rewrite if the requested header mode
+     * does not match the internal header mode, which is always
+     * AV_EXIF_TIFF_HEADER inside FFmpeg.
+     *
+     * If ifd.count == 0 then there's no data to write at all.
+     * This is possible if the frame width and height are zero and the orientation is 1.
+     */
+    rewrite = (rewrite || header_mode != AV_EXIF_TIFF_HEADER) && ifd.count;
+
     if (rewrite) {
         ret = av_exif_write(logctx, &ifd, &buffer, header_mode);
         if (ret < 0)
             goto end;
 
         *buffer_ptr = buffer;
-    } else {
+    } else if (sd_exif) {
         *buffer_ptr = av_buffer_ref(sd_exif->buf);
         if (!*buffer_ptr) {
             ret = AVERROR(ENOMEM);
@@ -1397,7 +1542,8 @@ int ff_exif_get_buffer(void *logctx, const AVFrame *frame, AVBufferRef **buffer_
     }
 
     av_exif_free(&ifd);
-    return rewrite;
+
+    return !!(rewrite || sd_exif);
 
 end:
     av_exif_free(&ifd);

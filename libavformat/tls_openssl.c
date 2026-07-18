@@ -20,9 +20,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/mem.h"
+#include "config_components.h"
+
 #include "network.h"
 #include "os_support.h"
+#include "libavutil/time.h"
 #include "libavutil/random_seed.h"
 #include "url.h"
 #include "tls.h"
@@ -32,7 +34,12 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
+#if HAVE_SYS_TIME_H
+#include <sys/time.h>
+#endif
+#include <string.h>
 
+#define DTLS_HANDSHAKE_TIMEOUT_US 30000000
 /**
  * Convert an EVP_PKEY to a PEM string.
  */
@@ -100,7 +107,7 @@ static int x509_fingerprint(X509 *cert, char **fingerprint)
     if (X509_digest(cert, EVP_sha256(), md, &n) != 1) {
         av_log(NULL, AV_LOG_ERROR, "TLS: Failed to generate fingerprint, %s\n",
                ERR_error_string(ERR_get_error(), NULL));
-        return AVERROR(ENOMEM);
+        return AVERROR(EINVAL);
     }
 
     av_bprint_init(&buf, n*3, n*3);
@@ -110,6 +117,14 @@ static int x509_fingerprint(X509 *cert, char **fingerprint)
     av_bprintf(&buf, "%02X", md[n - 1]);
 
     return av_bprint_finalize(&buf, fingerprint);
+}
+
+/* DTLS-SRTP authenticates self-signed WebRTC certificates by comparing the
+ * SDP fingerprint after the handshake. Request the certificate here while
+ * deferring trust to that exact fingerprint comparison. */
+static int accept_dtls_peer_for_fingerprint(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    return 1;
 }
 
 int ff_ssl_read_key_cert(char *key_url, char *cert_url, char *key_buf, size_t key_sz, char *cert_buf, size_t cert_sz, char **fingerprint)
@@ -267,7 +282,6 @@ static int openssl_gen_certificate(EVP_PKEY *pkey, X509 **cert, char **fingerpri
         goto enomem_end;
     }
 
-    // TODO: Support non-self-signed certificate, for example, load from a file.
     subject = X509_NAME_new();
     if (!subject) {
         goto enomem_end;
@@ -313,7 +327,7 @@ static int openssl_gen_certificate(EVP_PKEY *pkey, X509 **cert, char **fingerpri
         goto einval_end;
     }
 
-    if (!X509_sign(*cert, pkey, EVP_sha1())) {
+    if (!X509_sign(*cert, pkey, EVP_sha256())) {
         av_log(NULL, AV_LOG_ERROR, "TLS: Failed to sign certificate, %s\n", ERR_error_string(ERR_get_error(), NULL));
         goto einval_end;
     }
@@ -399,17 +413,16 @@ static EVP_PKEY *pkey_from_pem_string(const char *pem_str, int is_priv)
  */
 static X509 *cert_from_pem_string(const char *pem_str)
 {
+    X509 *cert = NULL;
     BIO *mem = BIO_new_mem_buf(pem_str, -1);
     if (!mem) {
         av_log(NULL, AV_LOG_ERROR, "BIO_new_mem_buf failed\n");
         return NULL;
     }
 
-    X509 *cert = PEM_read_bio_X509(mem, NULL, NULL, NULL);
-    if (!cert) {
+    cert = PEM_read_bio_X509(mem, NULL, NULL, NULL);
+    if (!cert)
         av_log(NULL, AV_LOG_ERROR, "Failed to parse certificate from string\n");
-        return NULL;
-    }
 
     BIO_free(mem);
     return cert;
@@ -474,6 +487,21 @@ int ff_dtls_export_materials(URLContext *h, char *dtls_srtp_materials, size_t ma
     return 0;
 }
 
+int ff_dtls_get_peer_fingerprint(URLContext *h, char **fingerprint)
+{
+    TLSContext *c = h->priv_data;
+    /* SSL_get1_peer_certificate() was only added in OpenSSL 3.0.  The
+     * historical spelling has the same get1/ref-counted semantics and also
+     * works with OpenSSL 1.1.x and LibreSSL, which FFmpeg still supports. */
+    X509 *cert = SSL_get_peer_certificate(c->ssl);
+    int ret;
+    if (!cert)
+        return AVERROR(EACCES);
+    ret = x509_fingerprint(cert, fingerprint);
+    X509_free(cert);
+    return ret;
+}
+
 static int print_ssl_error(URLContext *h, int ret)
 {
     TLSContext *c = h->priv_data;
@@ -531,8 +559,9 @@ static int url_bio_bread(BIO *b, char *buf, int len)
 {
     TLSContext *c = BIO_get_data(b);
     TLSShared *s = &c->tls_shared;
-    int ret = ffurl_read(c->tls_shared.is_dtls ? c->tls_shared.udp : c->tls_shared.tcp, buf, len);
+    int ret = ffurl_read(s->is_dtls ? s->udp : s->tcp, buf, len);
     if (ret >= 0) {
+#if CONFIG_UDP_PROTOCOL
         if (s->is_dtls && s->listen && !c->dest_addr_len) {
             int err_ret;
 
@@ -544,6 +573,7 @@ static int url_bio_bread(BIO *b, char *buf, int len)
             }
             av_log(c, AV_LOG_TRACE, "Set UDP remote addr on UDP socket, now 'connected'\n");
         }
+#endif
 
         return ret;
     }
@@ -587,21 +617,27 @@ static int url_bio_bputs(BIO *b, const char *str)
     return url_bio_bwrite(b, str, strlen(str));
 }
 
-static av_cold void init_bio_method(URLContext *h)
+static av_cold int init_bio_method(URLContext *h)
 {
     TLSContext *c = h->priv_data;
     BIO *bio;
     c->url_bio_method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "urlprotocol bio");
-    BIO_meth_set_write(c->url_bio_method, url_bio_bwrite);
-    BIO_meth_set_read(c->url_bio_method, url_bio_bread);
-    BIO_meth_set_puts(c->url_bio_method, url_bio_bputs);
-    BIO_meth_set_ctrl(c->url_bio_method, url_bio_ctrl);
-    BIO_meth_set_create(c->url_bio_method, url_bio_create);
-    BIO_meth_set_destroy(c->url_bio_method, url_bio_destroy);
+    if (!c->url_bio_method)
+        return AVERROR(ENOMEM);
+    if (!BIO_meth_set_write(c->url_bio_method, url_bio_bwrite) ||
+        !BIO_meth_set_read(c->url_bio_method, url_bio_bread) ||
+        !BIO_meth_set_puts(c->url_bio_method, url_bio_bputs) ||
+        !BIO_meth_set_ctrl(c->url_bio_method, url_bio_ctrl) ||
+        !BIO_meth_set_create(c->url_bio_method, url_bio_create) ||
+        !BIO_meth_set_destroy(c->url_bio_method, url_bio_destroy))
+        return AVERROR_EXTERNAL;
     bio = BIO_new(c->url_bio_method);
+    if (!bio)
+        return AVERROR(ENOMEM);
     BIO_set_data(bio, c);
 
     SSL_set_bio(c->ssl, bio, bio);
+    return 0;
 }
 
 static void openssl_info_callback(const SSL *ssl, int where, int ret) {
@@ -625,30 +661,80 @@ static void openssl_info_callback(const SSL *ssl, int where, int ret) {
 
 static int dtls_handshake(URLContext *h)
 {
-    int ret = 1, r0, r1;
     TLSContext *c = h->priv_data;
+    int ret, err;
+    int timeout_ms;
+    struct timeval timeout;
+    int64_t timeout_start = av_gettime_relative();
+    int sockfd = ffurl_get_file_handle(c->tls_shared.udp);
+    struct pollfd pfd = { .fd = sockfd, .events = POLLIN, .revents = 0 };
 
-    c->tls_shared.udp->flags &= ~AVIO_FLAG_NONBLOCK;
+    /* Force NONBLOCK mode to handle DTLS retransmissions */
+    c->tls_shared.udp->flags |= AVIO_FLAG_NONBLOCK;
 
-    r0 = SSL_do_handshake(c->ssl);
-    if (r0 <= 0) {
-        r1 = SSL_get_error(c->ssl, r0);
-
-        if (r1 != SSL_ERROR_WANT_READ && r1 != SSL_ERROR_WANT_WRITE && r1 != SSL_ERROR_ZERO_RETURN) {
-            av_log(c, AV_LOG_ERROR, "Handshake failed, r0=%d, r1=%d\n", r0, r1);
-            ret = print_ssl_error(h, r0);
+    for (;;) {
+        if (av_gettime_relative() - timeout_start > DTLS_HANDSHAKE_TIMEOUT_US) {
+            ret = AVERROR(ETIMEDOUT);
             goto end;
         }
-    } else {
-        av_log(c, AV_LOG_TRACE, "Handshake success, r0=%d\n", r0);
-    }
 
+        ret = SSL_do_handshake(c->ssl);
+        if (ret == 1) {
+            av_log(c, AV_LOG_TRACE, "Handshake success\n");
+            break;
+        }
+        err = SSL_get_error(c->ssl, ret);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_ZERO_RETURN) {
+            av_log(c, AV_LOG_ERROR, "Handshake failed, ret=%d, err=%d\n", ret, err);
+            ret = print_ssl_error(h, ret);
+            goto end;
+        }
+
+        /* A caller that explicitly opened the DTLS URL as nonblocking owns the
+         * progression budget. Do not hide a one-second poll (or the protocol's
+         * 30-second aggregate timeout) inside ffurl_handshake(): WHEP advances
+         * this state machine from a cancellable worker and must be able to honor
+         * its own shorter handshake deadline. OpenSSL requires an explicit timer
+         * tick for DTLS retransmissions, so service an already-expired timer
+         * before yielding EAGAIN. */
+        if (h->flags & AVIO_FLAG_NONBLOCK) {
+            if (DTLSv1_get_timeout(c->ssl, &timeout) &&
+                timeout.tv_sec == 0 && timeout.tv_usec == 0 &&
+                DTLSv1_handle_timeout(c->ssl) < 0) {
+                ret = AVERROR(EIO);
+                goto end;
+            }
+            ret = AVERROR(EAGAIN);
+            goto end;
+        }
+
+        timeout_ms = 1000;
+        if (DTLSv1_get_timeout(c->ssl, &timeout))
+            timeout_ms = timeout.tv_sec * 1000 + timeout.tv_usec / 1000;
+
+        ret = poll(&pfd, 1, timeout_ms);
+        if (ret > 0 && (pfd.revents & POLLIN))
+            continue;
+        if (!ret) {
+            if (DTLSv1_handle_timeout(c->ssl) < 0) {
+                ret = AVERROR(EIO);
+                goto end;
+            }
+            continue;
+        }
+        if (ret < 0) {
+            ret = ff_neterrno();
+            goto end;
+        }
+    }
     /* Check whether the handshake is completed. */
     if (SSL_is_init_finished(c->ssl) != TLS_ST_OK)
         goto end;
 
     ret = 0;
 end:
+    if (!(h->flags & AVIO_FLAG_NONBLOCK))
+        c->tls_shared.udp->flags &= ~AVIO_FLAG_NONBLOCK;
     return ret;
 }
 
@@ -736,43 +822,55 @@ fail:
     return ret;
 }
 
-/**
- * Once the DTLS role has been negotiated - active for the DTLS client or passive for the
- * DTLS server - we proceed to set up the DTLS state and initiate the handshake.
- */
-static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **options)
+static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
 {
     TLSContext *c = h->priv_data;
     TLSShared *s = &c->tls_shared;
-    int ret = 0;
-    s->is_dtls = 1;
+    int ret;
 
     if (!c->tls_shared.external_sock) {
-        if ((ret = ff_tls_open_underlying(&c->tls_shared, h, url, options)) < 0) {
-            av_log(c, AV_LOG_ERROR, "Failed to connect %s\n", url);
-            return ret;
-        }
+        if ((ret = ff_tls_open_underlying(&c->tls_shared, h, uri, options)) < 0)
+            goto fail;
+    } else if (!s->host) {
+        if ((ret = ff_tls_parse_host(s, s->underlying_host, sizeof(s->underlying_host), NULL, uri)) < 0)
+            goto fail;
     }
 
-    c->ctx = SSL_CTX_new(s->listen ? DTLS_server_method() : DTLS_client_method());
+    // We want to support all versions of TLS >= 1.0, but not the deprecated
+    // and insecure SSLv2 and SSLv3.  Despite the name, TLS_*_method()
+    // enables support for all versions of SSL and TLS, and we then disable
+    // support for the old protocols immediately after creating the context.
+    if (s->is_dtls)
+        c->ctx = SSL_CTX_new(s->listen ? DTLS_server_method() : DTLS_client_method());
+    else
+        c->ctx = SSL_CTX_new(s->listen ? TLS_server_method() : TLS_client_method());
     if (!c->ctx) {
-        ret = AVERROR(ENOMEM);
+        av_log(h, AV_LOG_ERROR, "%s\n", openssl_get_error(c));
+        ret = AVERROR(EIO);
         goto fail;
     }
-
+    if (!s->is_dtls) {
+        if (!SSL_CTX_set_min_proto_version(c->ctx, TLS1_VERSION)) {
+            av_log(h, AV_LOG_ERROR, "Failed to set minimum TLS version to TLSv1\n");
+            ret = AVERROR_EXTERNAL;
+            goto fail;
+        }
+    }
     ret = openssl_init_ca_key_cert(h);
     if (ret < 0) goto fail;
 
-    /* Note, this doesn't check that the peer certificate actually matches the requested hostname. */
-    if (s->verify)
+    if (s->is_dtls && s->use_srtp && s->listen)
+        SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                           accept_dtls_peer_for_fingerprint);
+    else if (s->verify)
         SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 
-    if (s->use_srtp) {
+    if (s->is_dtls && s->use_srtp) {
         /**
          * The profile for OpenSSL's SRTP is SRTP_AES128_CM_SHA1_80, see ssl/d1_srtp.c.
          * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
          */
-        const char* profiles = "SRTP_AES128_CM_SHA1_80";
+        const char *profiles = "SRTP_AES128_CM_SHA1_80";
         if (SSL_CTX_set_tlsext_use_srtp(c->ctx, profiles)) {
             av_log(c, AV_LOG_ERROR, "Init SSL_CTX_set_tlsext_use_srtp failed, profiles=%s, %s\n",
                 profiles, openssl_get_error(c));
@@ -781,94 +879,6 @@ static int dtls_start(URLContext *h, const char *url, int flags, AVDictionary **
         }
     }
 
-    /* The ssl should not be created unless the ctx has been initialized. */
-    c->ssl = SSL_new(c->ctx);
-    if (!c->ssl) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    if (!s->listen && !s->numerichost)
-        SSL_set_tlsext_host_name(c->ssl, s->host);
-
-    /* Setup the callback for logging. */
-    SSL_set_ex_data(c->ssl, 0, c);
-    SSL_CTX_set_info_callback(c->ctx, openssl_info_callback);
-
-    /**
-     * We have set the MTU to fragment the DTLS packet. It is important to note that the
-     * packet is split to ensure that each handshake packet is smaller than the MTU.
-     */
-    if (s->mtu <= 0)
-        s->mtu = 1096;
-    SSL_set_options(c->ssl, SSL_OP_NO_QUERY_MTU);
-    SSL_set_mtu(c->ssl, s->mtu);
-    DTLS_set_link_mtu(c->ssl, s->mtu);
-    init_bio_method(h);
-
-    /* This seems to be necessary despite explicitly setting client/server method above. */
-    if (s->listen)
-        SSL_set_accept_state(c->ssl);
-    else
-        SSL_set_connect_state(c->ssl);
-
-    /**
-     * During initialization, we only need to call SSL_do_handshake once because SSL_read consumes
-     * the handshake message if the handshake is incomplete.
-     * To simplify maintenance, we initiate the handshake for both the DTLS server and client after
-     * sending out the ICE response in the start_active_handshake function. It's worth noting that
-     * although the DTLS server may receive the ClientHello immediately after sending out the ICE
-     * response, this shouldn't be an issue as the handshake function is called before any DTLS
-     * packets are received.
-     *
-     * The SSL_do_handshake can't be called if DTLS hasn't prepare for udp.
-     */
-    if (!c->tls_shared.external_sock) {
-        ret = dtls_handshake(h);
-        // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
-        if (ret < 0) {
-            av_log(c, AV_LOG_ERROR, "Failed to drive SSL context, ret=%d\n", ret);
-            return AVERROR(EIO);
-        }
-    }
-
-    av_log(c, AV_LOG_VERBOSE, "Setup ok, MTU=%d\n", c->tls_shared.mtu);
-
-    return 0;
-fail:
-    tls_close(h);
-    return ret;
-}
-
-static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
-{
-    TLSContext *c = h->priv_data;
-    TLSShared *s = &c->tls_shared;
-    int ret;
-
-    if ((ret = ff_tls_open_underlying(s, h, uri, options)) < 0)
-        goto fail;
-
-    // We want to support all versions of TLS >= 1.0, but not the deprecated
-    // and insecure SSLv2 and SSLv3.  Despite the name, TLS_*_method()
-    // enables support for all versions of SSL and TLS, and we then disable
-    // support for the old protocols immediately after creating the context.
-    c->ctx = SSL_CTX_new(s->listen ? TLS_server_method() : TLS_client_method());
-    if (!c->ctx) {
-        av_log(h, AV_LOG_ERROR, "%s\n", openssl_get_error(c));
-        ret = AVERROR(EIO);
-        goto fail;
-    }
-    if (!SSL_CTX_set_min_proto_version(c->ctx, TLS1_VERSION)) {
-        av_log(h, AV_LOG_ERROR, "Failed to set minimum TLS version to TLSv1\n");
-        ret = AVERROR_EXTERNAL;
-        goto fail;
-    }
-    ret = openssl_init_ca_key_cert(h);
-    if (ret < 0) goto fail;
-
-    if (s->verify)
-        SSL_CTX_set_verify(c->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
     c->ssl = SSL_new(c->ctx);
     if (!c->ssl) {
         av_log(h, AV_LOG_ERROR, "%s\n", openssl_get_error(c));
@@ -877,7 +887,22 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
     }
     SSL_set_ex_data(c->ssl, 0, c);
     SSL_CTX_set_info_callback(c->ctx, openssl_info_callback);
-    init_bio_method(h);
+
+    if (s->is_dtls) {
+        /**
+         * We have set the MTU to fragment the DTLS packet. It is important to note that the
+         * packet is split to ensure that each handshake packet is smaller than the MTU.
+         */
+        if (s->mtu <= 0)
+            s->mtu = 1096;
+        SSL_set_options(c->ssl, SSL_OP_NO_QUERY_MTU);
+        SSL_set_mtu(c->ssl, s->mtu);
+        DTLS_set_link_mtu(c->ssl, s->mtu);
+    }
+
+    ret = init_bio_method(h);
+    if (ret < 0)
+        goto fail;
     if (!s->listen && !s->numerichost) {
         // By default OpenSSL does too lax wildcard matching
         SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
@@ -893,20 +918,49 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
             goto fail;
         }
     }
-    ret = s->listen ? SSL_accept(c->ssl) : SSL_connect(c->ssl);
-    if (ret == 0) {
-        av_log(h, AV_LOG_ERROR, "Unable to negotiate TLS/SSL session\n");
-        ret = AVERROR(EIO);
-        goto fail;
-    } else if (ret < 0) {
-        ret = print_ssl_error(h, ret);
-        goto fail;
+
+    if (s->is_dtls) {
+        /* This seems to be necessary despite explicitly setting client/server method above. */
+        if (s->listen)
+            SSL_set_accept_state(c->ssl);
+        else
+            SSL_set_connect_state(c->ssl);
+
+        /* The SSL_do_handshake can't be called if DTLS hasn't prepared for udp. */
+        if (!c->tls_shared.external_sock) {
+            ret = dtls_handshake(h);
+            // Fatal SSL error, for example, no available suite when peer is DTLS 1.0 while we are DTLS 1.2.
+            if (ret < 0) {
+                av_log(c, AV_LOG_ERROR, "Failed to drive SSL context, ret=%d\n", ret);
+                ret = AVERROR(EIO);
+                goto fail;
+            }
+        }
+        av_log(c, AV_LOG_VERBOSE, "Setup ok, MTU=%d\n", c->tls_shared.mtu);
+    } else {
+        ret = s->listen ? SSL_accept(c->ssl) : SSL_connect(c->ssl);
+        if (ret == 0) {
+            av_log(h, AV_LOG_ERROR, "Unable to negotiate TLS/SSL session\n");
+            ret = AVERROR(EIO);
+            goto fail;
+        } else if (ret < 0) {
+            ret = print_ssl_error(h, ret);
+            goto fail;
+        }
     }
 
     return 0;
 fail:
     tls_close(h);
     return ret;
+}
+
+static int dtls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
+{
+    TLSContext *c = h->priv_data;
+    TLSShared *s = &c->tls_shared;
+    s->is_dtls = 1;
+    return tls_open(h, uri, flags, options);
 }
 
 static int tls_read(URLContext *h, uint8_t *buf, int size)
@@ -933,7 +987,7 @@ static int tls_write(URLContext *h, const uint8_t *buf, int size)
     URLContext *uc = s->is_dtls ? s->udp : s->tcp;
     int ret;
 
-    // Set or clear the AVIO_FLAG_NONBLOCK on c->tls_shared.tcp
+    // Set or clear the AVIO_FLAG_NONBLOCK on the underlying socket
     uc->flags &= ~AVIO_FLAG_NONBLOCK;
     uc->flags |= h->flags & AVIO_FLAG_NONBLOCK;
 
@@ -998,7 +1052,7 @@ static const AVClass dtls_class = {
 
 const URLProtocol ff_dtls_protocol = {
     .name           = "dtls",
-    .url_open2      = dtls_start,
+    .url_open2      = dtls_open,
     .url_handshake  = dtls_handshake,
     .url_close      = tls_close,
     .url_read       = tls_read,
