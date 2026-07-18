@@ -3932,6 +3932,12 @@ static int create_rtp_muxer(AVFormatContext *s)
                                                  : whip->audio_ssrc[audio_index], 0);
         av_dict_set_int(&opts, "seq", is_video ? whip->video_first_seq
                                                 : whip->audio_first_seq[audio_index], 0);
+        /* The playout demuxer paces packets at their presentation time, so
+         * pair each SR with the outgoing packet's own RTP timestamp. The
+         * default wall-elapsed mapping anchors to muxer creation, which a
+         * hold_until_publish generation precedes by the entire hold — the
+         * browser then misjudges A/V sync and frame captureTime by that gap. */
+        av_dict_set(&opts, "rtpflags", "+pkt_ts_sr", 0);
         ret = avformat_write_header(rtp_ctx, &opts);
         if (ret < 0) {
             av_log(whip, AV_LOG_ERROR, "Failed to write rtp header\n");
