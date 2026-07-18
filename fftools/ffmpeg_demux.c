@@ -858,7 +858,13 @@ static int input_thread(void *arg)
     discard_unused_programs(f);
 
     d->read_started    = 1;
-    d->wallclock_start = av_gettime_relative();
+    /* The readrate wallclock is anchored at the FIRST demuxed packet, not at
+     * thread start: an input that legitimately produces nothing for a while
+     * (the playout demuxer's hold_until_publish admission fence) must not
+     * bank that wait as "lag" — the catchup limiter would then run the whole
+     * session readrate_catchup (1.05x) fast for 20x the held duration,
+     * drifting A/V and captions further the longer it plays. */
+    d->wallclock_start = 0;
 
     while (1) {
         DemuxStream *ds;
@@ -899,6 +905,9 @@ static int input_thread(void *arg)
 
             break;
         }
+
+        if (!d->wallclock_start)
+            d->wallclock_start = av_gettime_relative();
 
         if (do_pkt_dump) {
             av_pkt_dump_log2(NULL, AV_LOG_INFO, dt.pkt_demux, do_hex_dump,

@@ -324,6 +324,9 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
         rtp_ts = av_rescale_q(ntp_time - s->first_rtcp_ntp_time, (AVRational){1, 1000000},
                               s1->streams[0]->time_base) + s->base_timestamp;
     }
+    av_log(s1, AV_LOG_DEBUG, "SR ssrc=%u pt=%d unix_ms=%.3f rtp_ts=%u base=%u cur=%u\n",
+           s->ssrc, s->payload_type, (ntp_time - NTP_OFFSET_US) / 1000.0,
+           rtp_ts, s->base_timestamp, s->cur_timestamp);
     avio_w8(s1->pb, RTP_VERSION << 6);
     avio_w8(s1->pb, RTCP_SR);
     avio_wb16(s1->pb, 6); /* length in words - 1 */
