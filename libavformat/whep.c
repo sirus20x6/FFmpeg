@@ -171,9 +171,12 @@
  * bandwidth_bps = (RTP payload bytes) * (RTP history size) * 8
  * Assumes average RTP payload is 1184 bytes (MTU - SRTP_CHECKSUM_LEN).
  */
-#define WHIP_RTP_HISTORY_MIN 64 /* around 0.61 Mbps */
-#define WHIP_RTP_HISTORY_DEFAULT 512 /* around 4.85 Mbps */
-#define WHIP_RTP_HISTORY_MAX 2048 /* around 19.40 Mbps */
+#define WHIP_RTP_HISTORY_MIN 64 /* around 0.61 Mbps-seconds */
+/* The history doubles as the join-time GOP replay buffer: it must span a
+ * whole keyframe interval, not just the NACK round trip. 4096 packets at
+ * ~1184B is ~38.8 Mbit — a 5s GOP up to ~7.7 Mbps. */
+#define WHIP_RTP_HISTORY_DEFAULT 4096
+#define WHIP_RTP_HISTORY_MAX 8192
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((float)(endtime - starttime) / 1000)
@@ -434,6 +437,12 @@ typedef struct WHIPContext {
     RtpHistoryItem *hist;
     uint8_t *hist_pool;
     int hist_head;
+
+    /* Join-time GOP replay: seq of the first RTP packet of the most recent
+     * video keyframe, so a mid-GOP joiner can be caught up immediately. */
+    int next_video_is_idr;
+    int idr_valid;
+    uint16_t idr_seq;
 } WHIPContext;
 
 /**
@@ -3791,6 +3800,11 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
      * sender reports share this callback but do not have an RTP sequence at
      * bytes 2..3; storing them there corrupts the NACK lookup ring. */
     if (is_video && !is_rtcp) {
+        if (whip->next_video_is_idr) {
+            whip->idr_seq = AV_RB16(buf + 2);
+            whip->idr_valid = 1;
+            whip->next_video_is_idr = 0;
+        }
         ret = rtp_history_store(whip, buf, buf_size);
         if (ret < 0)
             return ret;
@@ -4233,6 +4247,51 @@ end:
         av_log(whip, AV_LOG_WARNING, "Failed to send RTX packet, skip this one\n");
 }
 
+/* A viewer joining mid-GOP would show nothing until the next IDR: video is
+ * stream-copied, so no keyframe can be produced on demand, and movie GOPs
+ * run multiple seconds. Replay the buffered video history from the most
+ * recent IDR to the freshly-READY session so its decoder starts immediately.
+ * Replayed packets keep their original seq/timestamps — the live stream
+ * continues contiguously after them, and any burst drops are recovered by
+ * the normal NACK/RTX path. Runs on the muxer thread, so no ring races. */
+static void whep_replay_gop(AVFormatContext *s, WHEPSession *sess)
+{
+    WHIPContext *whip = s->priv_data;
+    uint8_t plain[MAX_UDP_BUFFER_SIZE];
+    uint16_t latest_seq, seq;
+    uint32_t count, i;
+    int cipher_size, ret;
+
+    if (!whip->idr_valid || !whip->hist)
+        return;
+    latest_seq = whip->hist[(whip->hist_head - 1 + whip->hist_sz) % whip->hist_sz].seq;
+    count = (uint16_t)(latest_seq - whip->idr_seq) + 1;
+    if (count > (uint32_t)whip->hist_sz)
+        return; /* the IDR has been overwritten; join waits as before */
+    for (i = 0, seq = whip->idr_seq; i < count; i++, seq++) {
+        const RtpHistoryItem *it = rtp_history_find(whip, seq);
+        if (!it || it->size < WHIP_RTP_HEADER_SIZE)
+            return;
+        memcpy(plain, it->buf, it->size);
+        plain[1] = (plain[1] & 0x80) | sess->video_payload_type;
+        cipher_size = ff_srtp_encrypt(&sess->srtp_video_send, plain, it->size,
+                                      sess->buf, sizeof(sess->buf));
+        if (cipher_size <= 0) {
+            av_log(whip, AV_LOG_WARNING,
+                   "WHEP GOP replay encrypt failed for viewer on port %d\n",
+                   sess->local_udp_port);
+            return;
+        }
+        ret = ffurl_write(sess->udp, sess->buf, cipher_size);
+        whep_note_udp_send_result(whip, sess, ret, cipher_size, "GOP replay");
+        if (sess->state == WHEP_SESSION_DEAD)
+            return;
+    }
+    av_log(whip, AV_LOG_INFO,
+           "WHEP replayed %u video packets from the last IDR to viewer on port %d\n",
+           count, sess->local_udp_port);
+}
+
 /* Authenticate/decrypt one SRTCP datagram, then walk every RTCP packet in the
  * compound plaintext.  Chrome commonly sends RR (PT=201) first and RTPFB NACK
  * (PT=205/FMT=1) later; inspecting only the encrypted datagram's first PT
@@ -4643,6 +4702,7 @@ static void whep_poll_sessions(AVFormatContext *s)
                             av_log(whip, AV_LOG_INFO,
                                    "WHEP viewer on port %d READY\n",
                                    sess->local_udp_port);
+                            whep_replay_gop(s, sess);
                         }
                     }
                 } else {
@@ -4765,6 +4825,12 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
             goto end;
         }
     }
+
+    /* Mark the keyframe so on_rtp_write_packet can record the seq of its
+     * first RTP packet — the anchor for join-time GOP replay. */
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (pkt->flags & AV_PKT_FLAG_KEY))
+        whip->next_video_is_idr = 1;
 
     /* vp9_superframe_split intentionally clears PTS on invisible coded
      * frames. They still need an RTP timestamp; their DTS is the timestamp of
