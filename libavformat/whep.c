@@ -4326,6 +4326,14 @@ static void whep_replay_gop(AVFormatContext *s, WHEPSession *sess)
         whep_note_udp_send_result(whip, sess, ret, cipher_size, "GOP replay");
         if (sess->state == WHEP_SESSION_DEAD)
             return;
+        /* Never blast the whole GOP back-to-back: a multi-hundred-packet
+         * UDP burst overflows shallow middlebox queues on real viewer
+         * paths, dropping the burst tail AND the live packets behind it —
+         * the join then opens with a ~1s freeze while NACK/RTX recovers.
+         * 16-packet microbursts 2ms apart spread a 550-packet replay over
+         * ~70ms, one frame of muxer-thread delay at worst. */
+        if ((i & 15) == 15)
+            av_usleep(2000);
     }
     av_log(whip, AV_LOG_INFO,
            "WHEP replayed %u video packets (%u frames, compressed to live edge) to viewer on port %d\n",
