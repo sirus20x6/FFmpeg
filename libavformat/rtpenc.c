@@ -313,14 +313,13 @@ static void rtcp_send_sr(AVFormatContext *s1, int64_t ntp_time, int bye)
 
     s->last_rtcp_ntp_time = ntp_time;
     if (s->flags & FF_RTP_FLAG_PKT_TS_SR) {
-        /* A realtime-paced sender emits each packet at its presentation
-         * time, so (this packet's RTP timestamp, NTP now) is a truthful
-         * clock pair. The wall-elapsed extrapolation below is not: it
-         * anchors to muxer creation, which precedes the first packet by
-         * the whole hold_until_publish window (and survives session
-         * adoption), skewing receiver A/V sync and captureTime by that
-         * gap. */
-        rtp_ts = s->cur_timestamp;
+        /* A realtime-paced sender emits each packet at its (DTS) air
+         * time, so (the outgoing packet's DTS as an RTP value, NTP now)
+         * is a truthful clock pair. The wall-elapsed extrapolation below
+         * is not: it anchors to muxer creation, which precedes the first
+         * packet by the whole hold_until_publish window, skewing
+         * receiver A/V sync and captureTime by that gap. */
+        rtp_ts = s->sr_pkt_ts;
     } else {
         rtp_ts = av_rescale_q(ntp_time - s->first_rtcp_ntp_time, (AVRational){1, 1000000},
                               s1->streams[0]->time_base) + s->base_timestamp;
@@ -552,22 +551,34 @@ static int rtp_write_packet(AVFormatContext *s1, AVPacket *pkt)
     RTPMuxContext *s = s1->priv_data;
     AVStream *st = s1->streams[0];
     int rtcp_bytes;
+    int64_t sr_interval_us = 5000000;
     int size= pkt->size;
 
     av_log(s1, AV_LOG_TRACE, "%d: write len=%d\n", pkt->stream_index, size);
 
-    /* cur_timestamp must be current before a sender report goes out:
-     * PKT_TS_SR pairs this packet's RTP timestamp with NTP-now. */
     s->cur_timestamp = s->base_timestamp + pkt->pts;
+    /* PKT_TS_SR anchor: realtime pacing runs on DTS, so the stream
+     * position airing at this instant is the packet's DTS, not its PTS.
+     * Anchoring on PTS would wobble the SR line by the B-frame reorder
+     * distance and skew video against audio by up to that much. */
+    s->sr_pkt_ts = s->base_timestamp +
+                   (pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts);
 
     rtcp_bytes = ((s->octet_count - s->last_octet_count) * RTCP_TX_RATIO_NUM) /
         RTCP_TX_RATIO_DEN;
+    /* WebRTC receivers need at least two SRs per stream before A/V sync
+     * and capture-time mapping engage; front-load a few so a fresh
+     * session converges in ~1s instead of ~5s. */
+    if (s->flags & FF_RTP_FLAG_PKT_TS_SR)
+        sr_interval_us = s->sr_fast_count < 4 ? 1000000 : 5000000;
     if ((s->first_packet || ((rtcp_bytes >= RTCP_SR_SIZE) &&
-                            (ff_ntp_time() - s->last_rtcp_ntp_time > 5000000))) &&
+                            (ff_ntp_time() - s->last_rtcp_ntp_time > sr_interval_us))) &&
         !(s->flags & FF_RTP_FLAG_SKIP_RTCP)) {
         rtcp_send_sr(s1, ff_ntp_time(), 0);
         s->last_octet_count = s->octet_count;
         s->first_packet = 0;
+        if (s->sr_fast_count < 4)
+            s->sr_fast_count++;
     }
 
     switch(st->codecpar->codec_id) {

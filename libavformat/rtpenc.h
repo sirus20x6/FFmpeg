@@ -41,6 +41,10 @@ struct RTPMuxContext {
     /* rtcp sender statistics */
     int64_t last_rtcp_ntp_time;
     int64_t first_rtcp_ntp_time;
+    /* PKT_TS_SR: RTP value of the stream position airing "now" — the
+     * outgoing packet's DTS, since realtime pacing runs on DTS. */
+    uint32_t sr_pkt_ts;
+    int sr_fast_count;
     unsigned int packet_count;
     unsigned int octet_count;
     unsigned int last_octet_count;
