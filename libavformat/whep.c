@@ -4251,15 +4251,22 @@ end:
  * stream-copied, so no keyframe can be produced on demand, and movie GOPs
  * run multiple seconds. Replay the buffered video history from the most
  * recent IDR to the freshly-READY session so its decoder starts immediately.
- * Replayed packets keep their original seq/timestamps — the live stream
- * continues contiguously after them, and any burst drops are recovered by
- * the normal NACK/RTX path. Runs on the muxer thread, so no ring races. */
+ *
+ * The replayed copies keep their original seq numbers (so the live stream
+ * continues contiguously and NACK/RTX recovers burst drops) but their RTP
+ * timestamps are REWRITTEN to a compressed run ending 1ms per frame short of
+ * the live edge. With original timestamps the browser would present the
+ * whole buffered GOP as a real-time rewind-replay and anchor its video
+ * timeline seconds behind the live audio, forcing a long A/V re-sync; the
+ * compressed run instead decodes every reference frame and renders as an
+ * instant catch-up flash at the live edge. Runs on the muxer thread, so no
+ * ring races. */
 static void whep_replay_gop(AVFormatContext *s, WHEPSession *sess)
 {
     WHIPContext *whip = s->priv_data;
     uint8_t plain[MAX_UDP_BUFFER_SIZE];
     uint16_t latest_seq, seq;
-    uint32_t count, i;
+    uint32_t count, i, nframes, frame_idx, prev_ts, edge_ts, have_prev;
     int cipher_size, ret;
 
     if (!whip->idr_valid || !whip->hist)
@@ -4268,11 +4275,44 @@ static void whep_replay_gop(AVFormatContext *s, WHEPSession *sess)
     count = (uint16_t)(latest_seq - whip->idr_seq) + 1;
     if (count > (uint32_t)whip->hist_sz)
         return; /* the IDR has been overwritten; join waits as before */
+
+    /* Pass 1: count frames (timestamp changes) and find the live-edge ts. */
+    nframes = 0;
+    prev_ts = 0;
+    edge_ts = 0;
+    have_prev = 0;
     for (i = 0, seq = whip->idr_seq; i < count; i++, seq++) {
         const RtpHistoryItem *it = rtp_history_find(whip, seq);
         if (!it || it->size < WHIP_RTP_HEADER_SIZE)
             return;
+        edge_ts = AV_RB32(it->buf + 4);
+        if (!have_prev || edge_ts != prev_ts) {
+            nframes++;
+            prev_ts = edge_ts;
+            have_prev = 1;
+        }
+    }
+    if (!nframes)
+        return;
+
+    /* Pass 2: send with per-frame timestamps 90 ticks (1ms) apart, the run
+     * ending at the live edge so live continuation stays monotonic. */
+    frame_idx = 0;
+    have_prev = 0;
+    prev_ts = 0;
+    for (i = 0, seq = whip->idr_seq; i < count; i++, seq++) {
+        const RtpHistoryItem *it = rtp_history_find(whip, seq);
+        uint32_t orig_ts;
+        if (!it || it->size < WHIP_RTP_HEADER_SIZE)
+            return;
         memcpy(plain, it->buf, it->size);
+        orig_ts = AV_RB32(plain + 4);
+        if (!have_prev || orig_ts != prev_ts) {
+            frame_idx++;
+            prev_ts = orig_ts;
+            have_prev = 1;
+        }
+        AV_WB32(plain + 4, edge_ts - (nframes - frame_idx) * 90);
         plain[1] = (plain[1] & 0x80) | sess->video_payload_type;
         cipher_size = ff_srtp_encrypt(&sess->srtp_video_send, plain, it->size,
                                       sess->buf, sizeof(sess->buf));
@@ -4288,8 +4328,8 @@ static void whep_replay_gop(AVFormatContext *s, WHEPSession *sess)
             return;
     }
     av_log(whip, AV_LOG_INFO,
-           "WHEP replayed %u video packets from the last IDR to viewer on port %d\n",
-           count, sess->local_udp_port);
+           "WHEP replayed %u video packets (%u frames, compressed to live edge) to viewer on port %d\n",
+           count, nframes, sess->local_udp_port);
 }
 
 /* Authenticate/decrypt one SRTCP datagram, then walk every RTCP packet in the
